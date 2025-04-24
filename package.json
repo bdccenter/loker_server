@@ -1,0 +1,19 @@
+{
+  "name": "loker-node",
+  "version": "1.0.0",
+  "description": "loker server",
+  "main": "index.js",
+  "scripts": {
+    "test": "test",
+    "dev": "node server/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "mysql2": "^3.14.0"
+  },
+  "author": "Moises",
+  "license": "ISC"
+}
