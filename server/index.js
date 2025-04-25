@@ -305,7 +305,6 @@ app.post('/login', async (req, res) => {
 });
 
 // Iniciar el servidor
-app.listen(port, () => {
-  console.log(`Servidor ejecutándose en http://localhost:${port}`);
-  console.log(`Conectando a la base de datos en ${dbConfig.host}/${dbConfig.database}`);
-});
+app.listen(Number(process.env.PORT) || 3000, "0.0.0.0", () => {
+  console.log("Flashcardly server is now running!")
+})
