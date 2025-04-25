@@ -1,8 +1,8 @@
 // src/server/server.js
-const  express = requiere  ('express');
-const cors = requiere ('cors');
-const crypto = requiere ('crypto');
-const mysql = requiere ('mysql2/promise');
+const  express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const mysql = require('mysql2/promise');
 
 // Crear la aplicación Express
 const app = express();
