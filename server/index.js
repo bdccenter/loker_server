@@ -1,8 +1,8 @@
 // src/server/server.js
-import express from 'express';
-import cors from 'cors';
-import crypto from 'crypto';
-import mysql from 'mysql2/promise';
+const  express = requiere  ('express');
+const cors = requiere ('cors');
+const crypto = requiere ('crypto');
+const mysql = requiere ('mysql2/promise');
 
 // Crear la aplicación Express
 const app = express();
