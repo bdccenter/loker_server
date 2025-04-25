@@ -306,5 +306,5 @@ app.post('/login', async (req, res) => {
 
 // Iniciar el servidor
 app.listen( port, "0.0.0.0", () => {
-  console.log("Flashcardly server is now running!")
+  console.log ("Flashcardly server is now running! "  +  port);
 })
