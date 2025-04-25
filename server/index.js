@@ -6,7 +6,8 @@ const mysql = require('mysql2/promise');
 
 // Crear la aplicación Express
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
+
 
 // Configuración CORS básica
 app.use(cors());
@@ -16,11 +17,12 @@ app.use(express.json());
 
 // Configuración de la conexión a la base de datos MySQL
 const dbConfig = {
-  host: 'localhost',
-  user: 'root',
-  password: '',
-  database: 'autoinsights',
-  connectionLimit: 10
+  host: process.env.HOST_DB || 'localhost',
+  port: process.env.PORT_DB || 3306,
+  user: process.env.USER || 'root',
+  password: process.env.PASSWORD || 'root',
+  database: process.env.DATABASE || 'test',
+  connectionLimit: process.env.CONNECTION_LIMIT || 10,
 };
 
 // Crear el pool de conexiones
