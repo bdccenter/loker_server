@@ -70,17 +70,38 @@ console.log(`Buscando archivo de credenciales en: ${keyFilePath}`);
 
 let bigquery;
 try {
-  // Verifica si existe el archivo de credenciales
-  if (!fs.existsSync(keyFilePath)) {
-    throw new Error(`No se encontró el archivo de credenciales en: ${keyFilePath}`);
-  }
+  // Si hay variables de entorno completas, usarlas directamente
+  if (process.env.BQ_PROJECT_ID && process.env.BQ_PRIVATE_KEY && process.env.BQ_CLIENT_EMAIL) {
+    const credentials = {
+      type: process.env.BQ_TYPE || "service_account",
+      project_id: process.env.BQ_PROJECT_ID,
+      private_key_id: process.env.BQ_PRIVATE_KEY_ID,
+      private_key: process.env.BQ_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      client_email: process.env.BQ_CLIENT_EMAIL,
+      client_id: process.env.BQ_CLIENT_ID,
+      auth_uri: process.env.BQ_AUTH_URI || "https://accounts.google.com/o/oauth2/auth",
+      token_uri: process.env.BQ_TOKEN_URI || "https://oauth2.googleapis.com/token",
+      auth_provider_x509_cert_url: process.env.BQ_AUTH_PROVIDER_CERT_URL || "https://www.googleapis.com/oauth2/v1/certs",
+      client_x509_cert_url: process.env.BQ_CLIENT_CERT_URL,
+      universe_domain: process.env.BQ_UNIVERSE_DOMAIN || "googleapis.com"
+    };
 
-  // Inicializa BigQuery con el archivo de credenciales
-  bigquery = new BigQuery({
-    projectId: process.env.BQ_PROJECT_ID || JSON.parse(fs.readFileSync(keyFilePath, 'utf8')).project_id,
-    keyFilename: keyFilePath
-  });
-  console.log('✅ Cliente BigQuery inicializado correctamente');
+    bigquery = new BigQuery({
+      projectId: process.env.BQ_PROJECT_ID,
+      credentials: credentials
+    });
+    console.log('✅ Cliente BigQuery inicializado correctamente usando variables de entorno');
+  }
+  // Si no hay variables completas, intentar con el archivo de credenciales
+  else if (fs.existsSync(keyFilePath)) {
+    bigquery = new BigQuery({
+      keyFilename: keyFilePath
+    });
+    console.log('✅ Cliente BigQuery inicializado correctamente usando archivo de credenciales');
+  }
+  else {
+    throw new Error('No se encontraron credenciales válidas para BigQuery');
+  }
 } catch (error) {
   console.error('❌ ERROR: No se pudo inicializar el cliente de BigQuery:', error.message);
 }
@@ -216,13 +237,44 @@ async function executeQuery(projectId, query, useCache = true) {
     console.log(`Consulta a ejecutar:\n${query}`);
 
     // Si es necesario cambiar el proyecto y es diferente al predeterminado
-    if (projectId && projectId !== (process.env.BQ_PROJECT_ID || JSON.parse(fs.readFileSync(keyFilePath, 'utf8')).project_id)) {
+    if (projectId && projectId !== process.env.BQ_PROJECT_ID) {
       console.log(`Cambiando a proyecto: ${projectId}`);
 
-      const tempBigQuery = new BigQuery({
-        projectId: projectId,
-        keyFilename: keyFilePath
-      });
+      let tempBigQuery;
+
+      // Si hay variables de entorno, usarlas
+      if (process.env.BQ_PROJECT_ID && process.env.BQ_PRIVATE_KEY && process.env.BQ_CLIENT_EMAIL) {
+        const credentials = {
+          type: process.env.BQ_TYPE || "service_account",
+          project_id: process.env.BQ_PROJECT_ID,
+          private_key_id: process.env.BQ_PRIVATE_KEY_ID,
+          private_key: process.env.BQ_PRIVATE_KEY.replace(/\\n/g, '\n'),
+          client_email: process.env.BQ_CLIENT_EMAIL,
+          client_id: process.env.BQ_CLIENT_ID,
+          auth_uri: process.env.BQ_AUTH_URI || "https://accounts.google.com/o/oauth2/auth",
+          token_uri: process.env.BQ_TOKEN_URI || "https://oauth2.googleapis.com/token",
+          auth_provider_x509_cert_url: process.env.BQ_AUTH_PROVIDER_CERT_URL || "https://www.googleapis.com/oauth2/v1/certs",
+          client_x509_cert_url: process.env.BQ_CLIENT_CERT_URL,
+          universe_domain: process.env.BQ_UNIVERSE_DOMAIN || "googleapis.com"
+        };
+
+        tempBigQuery = new BigQuery({
+          projectId: projectId,
+          credentials: credentials
+        });
+        console.log(`Usando credenciales de variables de entorno para proyecto: ${projectId}`);
+      }
+      // Si no hay variables completas, intentar con el archivo
+      else if (fs.existsSync(keyFilePath)) {
+        tempBigQuery = new BigQuery({
+          projectId: projectId,
+          keyFilename: keyFilePath
+        });
+        console.log(`Usando archivo de credenciales para proyecto: ${projectId}`);
+      }
+      else {
+        throw new Error('No se encontraron credenciales válidas para BigQuery');
+      }
 
       const [rows] = await tempBigQuery.query({ query });
       console.log(`Consulta exitosa en ${projectId}: ${rows.length} filas obtenidas`);
