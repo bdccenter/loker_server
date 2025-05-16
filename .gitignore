@@ -1,10 +1,4 @@
-# Archivos de credenciales
-google-credentials.json
 .env
-*.pem
-*.key
 node_modules/
-
-# Directorios de cache y logs
-/logs/
-/cache/
+package-lock.json
+google-credentials.json
