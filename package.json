@@ -3,18 +3,24 @@
   "version": "1.0.0",
   "description": "loker server",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "test": "test",
     "dev": "node server/index.js",
-    "start": "node server/index.js"
+    "start": "cross-env NODE_OPTIONS=--openssl-legacy-provider node server/index.js"
   },
   "dependencies": {
+    "@google-cloud/bigquery": "^7.9.4",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
-    "mysql2": "^3.14.0"
+    "mysql2": "^3.14.0",
+    "node-cron": "^3.0.3"
   },
   "author": "Moises",
-  "license": "ISC"
+  "license": "ISC",
+  "devDependencies": {
+    "cross-env": "^7.0.3"
+  }
 }

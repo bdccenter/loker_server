@@ -1,7 +1,35 @@
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const mysql = require('mysql2/promise');
+// server/index.js - Versión ES modules
+import express from 'express';
+import cors from 'cors';
+import crypto from 'crypto';
+import mysql from 'mysql2/promise';
+import { fileURLToPath } from 'url';
+import path from 'path';
+import fs from 'fs';
+import dotenv from 'dotenv';
+
+// Cargar variables de entorno
+dotenv.config();
+
+// Importar servicios BigQuery
+import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache } from './service/bigQueryDirectService.js';
+
+
+// Obtener la ruta del archivo actual (necesario en ES modules)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Definir rutas para logs y cache
+const LOGS_DIR = path.join(__dirname, '../../logs');
+const CACHE_DIR = path.join(__dirname, '../../cache');
+
+// Asegurar que existen los directorios
+if (!fs.existsSync(LOGS_DIR)) {
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
+}
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 // Crear la aplicación Express
 const app = express();
@@ -34,6 +62,66 @@ const hashPassword = (password) => {
 // Ruta para verificar que el servidor está funcionando
 app.get('/api/test', (req, res) => {
   res.json({ message: 'Servidor funcionando correctamente' });
+});
+
+// Endpoint para obtener datos de una agencia específica
+app.get('/api/data/:agencyName', async (req, res) => {
+  try {
+    const { agencyName } = req.params;
+    // Convertir query params a filtros
+    const filters = req.query;
+    console.log(`Solicitud de datos para agencia: ${agencyName}, filtros:`, filters);
+
+    // Forzar el uso de caché siempre que sea posible
+    const useCache = true;
+
+    const data = await getAgencyData(agencyName, filters, useCache);
+    console.log(`Datos obtenidos para ${agencyName}: ${data.length} registros`);
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error en endpoint /api/data:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Añadir el resto de endpoints de BigQuery
+app.post('/api/cache/invalidate/:agencyName', (req, res) => {
+  try {
+    const { agencyName } = req.params;
+    console.log(`Invalidando caché para agencia: ${agencyName}`);
+
+    invalidateCache(agencyName);
+
+    res.json({ success: true, message: `Caché invalidada para ${agencyName}` });
+  } catch (error) {
+    console.error('Error en endpoint /api/cache/invalidate:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint para actualizar manualmente los datos
+app.post('/api/update', async (req, res) => {
+  try {
+    console.log("Iniciando actualización manual de datos...");
+    const { performUpdate } = await import('./service/scheduleDataUpdates.js');
+    
+    const success = await performUpdate('manual');
+    
+    res.json({
+      success,
+      message: success 
+        ? "Actualización de datos completada exitosamente" 
+        : "Actualización completada con advertencias"
+    });
+  } catch (error) {
+    console.error("Error durante la actualización manual:", error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      message: "Error al realizar la actualización de datos" 
+    });
+  }
 });
 
 // GET - Obtener todos los usuarios
@@ -221,6 +309,7 @@ app.delete('/users/:id', async (req, res) => {
   let connection;
 
   try {
+    // Obtener una conexión del pool
     connection = await pool.getConnection();
 
     // Verificar si el usuario existe
@@ -229,6 +318,7 @@ app.delete('/users/:id', async (req, res) => {
       [userId]
     );
 
+    // Si no existe, devolver un error 404
     if (existingUser.length === 0) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
@@ -238,7 +328,7 @@ app.delete('/users/:id', async (req, res) => {
       'DELETE FROM users WHERE id = ?',
       [userId]
     );
-
+    
     res.json({ message: 'Usuario eliminado con éxito', success: true });
   } catch (error) {
     console.error(`Error al eliminar usuario ${userId}:`, error);
@@ -257,7 +347,7 @@ app.post('/login', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ message: 'Se requiere email y contraseña' });
   }
-
+  
   try {
     // Obtener una conexión del pool
     connection = await pool.getConnection();
@@ -275,15 +365,15 @@ app.post('/login', async (req, res) => {
 
     const user = rows[0];
 
-    // Verificar la contraseña (usando bcrypt o el método que uses)
+    // Verificar la contraseña
     const hash = crypto.createHash('sha256').update(password).digest('hex');
     const passwordValid = hash === user.password || password === user.password;
-
+    
     if (!passwordValid) {
       return res.status(401).json({ message: 'Credenciales inválidas' });
     }
 
-    // Login exitoso - enviar datos del usuario (sin la contraseña)
+    // Login exitoso - enviar datos del usuario
     res.status(200).json({
       message: 'Inicio de sesión exitoso',
       user: {
@@ -299,12 +389,33 @@ app.post('/login', async (req, res) => {
     console.error('Error en el proceso de login:', error);
     res.status(500).json({ message: 'Error en el servidor' });
   } finally {
-    // Siempre liberar la conexión
     if (connection) connection.release();
   }
 });
 
+// Iniciar el servicio de actualización programada
+try {
+  console.log("Intentando iniciar servicio de actualización programada...");
+  const { initScheduleService } = await import('./service/scheduleDataUpdates.js');
+  
+  // Iniciar el servicio (que también hará la precarga inicial)
+  await initScheduleService();
+  console.log("Servicio de actualización programada iniciado correctamente");
+} catch (error) {
+  console.error("Error al iniciar servicio de actualización programada:", error);
+  
+  // Si falla el programador, al menos intentamos cargar los datos una vez
+  try {
+    console.log("Realizando precarga de datos fallback...");
+    await preloadAgencyData();
+    console.log("Precarga de fallback completada");
+  } catch (fallbackError) {
+    console.error("Error en la precarga de fallback:", fallbackError);
+  }
+}
+
 // Iniciar el servidor
 app.listen(port, "0.0.0.0", () => {
-  console.log("Flashcardly server is now running! " + port);
+  console.log(`Servidor backend Loker ejecutándose en puerto ${port}`);
+  console.log(`API disponible en http://localhost:${port}/api`);
 });
