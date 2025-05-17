@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "node server/index.js", 
-    "start": "cross-env NODE_OPTIONS=--openssl-legacy-provider node server/index.js",
+    "start": "NODE_OPTIONS=--openssl-legacy-provider node server/index.js",
     "test": "echo \"No test specified\" && exit 1"
   },
   "dependencies": {
