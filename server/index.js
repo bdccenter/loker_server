@@ -79,7 +79,7 @@ app.get('/api/data/:agencyName', async (req, res) => {
     console.log(`Datos obtenidos para ${agencyName}: ${data.length} registros`);
 
     res.json(data);
-  } catch (error) {
+  } catch (error) { // Manejo de errores
     console.error('Error en endpoint /api/data:', error);
     res.status(500).json({ error: error.message });
   }
@@ -87,14 +87,14 @@ app.get('/api/data/:agencyName', async (req, res) => {
 
 // Añadir el resto de endpoints de BigQuery
 app.post('/api/cache/invalidate/:agencyName', (req, res) => {
-  try {
+  try { // Endpoint para invalidar caché de una agencia específica
     const { agencyName } = req.params;
     console.log(`Invalidando caché para agencia: ${agencyName}`);
 
     invalidateCache(agencyName);
 
     res.json({ success: true, message: `Caché invalidada para ${agencyName}` });
-  } catch (error) {
+  } catch (error) { // Manejo de errores
     console.error('Error en endpoint /api/cache/invalidate:', error);
     res.status(500).json({ error: error.message });
   }
@@ -102,7 +102,7 @@ app.post('/api/cache/invalidate/:agencyName', (req, res) => {
 
 // Endpoint para actualizar manualmente los datos
 app.post('/api/update', async (req, res) => {
-  try {
+  try { // Endpoint para actualizar manualmente los datos
     console.log("Iniciando actualización manual de datos...");
     const { performUpdate } = await import('./service/scheduleDataUpdates.js');
     
@@ -127,7 +127,7 @@ app.post('/api/update', async (req, res) => {
 // GET - Obtener todos los usuarios
 app.get('/users', async (req, res) => {
   let connection;
-  try {
+  try {  // endopoint para obtener todos los usuarios
     // Obtener una conexión del pool
     connection = await pool.getConnection();
 
@@ -135,12 +135,12 @@ app.get('/users', async (req, res) => {
     const [rows] = await connection.execute(
       'SELECT id, is_superuser, first_name, last_name, email, Agencia FROM users'
     );
-
+    // Devolver los usuarios en formato JSON
     res.json({ users: rows });
-  } catch (error) {
+  } catch (error) {  // Manejo de errores
     console.error('Error al obtener usuarios:', error);
     res.status(500).json({ message: 'Error al obtener usuarios' });
-  } finally {
+  } finally { // liberar la conexion
     if (connection) connection.release();
   }
 });
@@ -150,7 +150,7 @@ app.get('/users/:id', async (req, res) => {
   const userId = parseInt(req.params.id);
   let connection;
 
-  try {
+  try { // endpoint para obtener un usuario en específico
     connection = await pool.getConnection();
 
     const [rows] = await connection.execute(
@@ -158,7 +158,7 @@ app.get('/users/:id', async (req, res) => {
       [userId]
     );
 
-    if (rows.length === 0) {
+    if (rows.length === 0) { // Si no se encuentra el usuario, devolver un error 404
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
