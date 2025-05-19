@@ -6,7 +6,7 @@ export async function initializeDatabase() {
 
     try {
         console.log('Intentando conectar a la base de datos para inicializar tablas...');
-        
+
         // Usar nuestra nueva función con reintentos (3 intentos, 2 segundos entre intentos)
         connection = await createConnectionWithRetry({
             connectTimeout: 30000 // 30 segundos de timeout
@@ -16,12 +16,13 @@ export async function initializeDatabase() {
 
         // Crear tabla query_cache
         await connection.execute(`
-      CREATE TABLE IF NOT EXISTS query_cache (
+        CREATE TABLE IF NOT EXISTS query_cache (
         cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
         data LONGTEXT NOT NULL,
-        timestamp DATETIME NOT NULL
-      )
-    `);
+        timestamp DATETIME NOT NULL,
+    is_compressed TINYINT(1) NOT NULL DEFAULT 0
+        )
+        `);
 
         // Crear tabla cache_metadata
         await connection.execute(`
