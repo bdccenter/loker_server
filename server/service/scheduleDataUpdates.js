@@ -1,9 +1,10 @@
-// server/service/scheduleDataUpdates.js
+// server/service/scheduleDataUpdates.js (versión mejorada)
 import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { preloadAgencyData } from './bigQueryDirectService.js';
+import { preloadAgencyData, agencyConfig } from './bigQueryDirectService.js';
+import { createConnectionWithRetry } from './dbConnection.js';
 
 // Obtener la ruta del archivo actual
 const __filename = fileURLToPath(import.meta.url);
@@ -56,6 +57,41 @@ async function performUpdate(scheduleName = 'programada') {
   logMessage(`Iniciando actualización ${scheduleName} de datos de BigQuery`);
 
   try {
+    // Obtener conexión a la base de datos
+    let connection;
+    try {
+      // Intentar conectar con 3 reintentos, 3 segundos entre intentos
+      connection = await createConnectionWithRetry({}, 3, 3000);
+      
+      // Actualizar estado de metadata a "updating"
+      for (const agency of Object.keys(agencyConfig)) {
+        try {
+          await connection.execute(
+            `INSERT INTO cache_metadata (agency, last_updated, status) 
+             VALUES (?, NOW(), 'updating') 
+             ON DUPLICATE KEY UPDATE last_updated = NOW(), status = 'updating'`,
+            [agency]
+          );
+          logMessage(`Metadata actualizada para ${agency}`);
+        } catch (metaError) {
+          logMessage(`Error al actualizar metadata para ${agency}: ${metaError.message}`);
+          // Continuar con las demás agencias
+        }
+      }
+    } catch (dbError) {
+      logMessage(`Error al conectar con la base de datos: ${dbError.message}`);
+      // Continuar con la actualización de datos sin la actualización de metadata
+    } finally {
+      if (connection) {
+        try {
+          await connection.end();
+          logMessage('Conexión a base de datos cerrada correctamente');
+        } catch (closeError) {
+          logMessage(`Error al cerrar la conexión: ${closeError.message}`);
+        }
+      }
+    }
+    
     // Precargar datos de todas las agencias
     await preloadAgencyData();
 

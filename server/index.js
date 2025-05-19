@@ -7,6 +7,8 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import { initializeDatabase } from './service/dbInitService.js';
+
 
 // Cargar variables de entorno
 dotenv.config();
@@ -40,6 +42,15 @@ app.use(cors());
 
 // Middleware para parsear JSON
 app.use(express.json());
+
+
+try {
+  console.log("Inicializando tablas de base de datos...");
+  await initializeDatabase();
+  console.log("Base de datos inicializada correctamente");
+} catch (error) {
+  console.error("Error al inicializar la base de datos:", error);
+}
 
 // Configuración de la conexión a la base de datos MySQL
 const dbConfig = {
@@ -85,6 +96,33 @@ app.get('/api/data/:agencyName', async (req, res) => {
   }
 });
 
+// Agregar un endpoint para ver estadísticas de caché
+app.get('/api/cache/stats', async (req, res) => {
+  try {
+    const connection = await mysql.createConnection({
+      host: process.env.MYSQLHOST || process.env.HOST_DB || 'localhost',
+      port: process.env.MYSQLPORT || process.env.PORT_DB || 3306,
+      user: process.env.MYSQLUSER || process.env.USER || 'root',
+      password: process.env.MYSQLPASSWORD || process.env.PASSWORD || 'root',
+      database: process.env.MYSQLDATABASE || process.env.DATABASE || 'railway'
+    });
+
+    const [metadata] = await connection.execute('SELECT * FROM cache_metadata');
+    const [cacheInfo] = await connection.execute('SELECT COUNT(*) as total, MAX(timestamp) as last_update FROM query_cache');
+
+    await connection.end();
+
+    res.json({
+      metadata,
+      cacheInfo: cacheInfo[0]
+    });
+  } catch (error) {
+    console.error('Error al obtener estadísticas de caché:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 // Añadir el resto de endpoints de BigQuery
 app.post('/api/cache/invalidate/:agencyName', (req, res) => {
   try { // Endpoint para invalidar caché de una agencia específica
@@ -105,21 +143,21 @@ app.post('/api/update', async (req, res) => {
   try { // Endpoint para actualizar manualmente los datos
     console.log("Iniciando actualización manual de datos...");
     const { performUpdate } = await import('./service/scheduleDataUpdates.js');
-    
+
     const success = await performUpdate('manual');
-    
+
     res.json({
       success,
-      message: success 
-        ? "Actualización de datos completada exitosamente" 
+      message: success
+        ? "Actualización de datos completada exitosamente"
         : "Actualización completada con advertencias"
     });
   } catch (error) {
     console.error("Error durante la actualización manual:", error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: error.message,
-      message: "Error al realizar la actualización de datos" 
+      message: "Error al realizar la actualización de datos"
     });
   }
 });
@@ -328,7 +366,7 @@ app.delete('/users/:id', async (req, res) => {
       'DELETE FROM users WHERE id = ?',
       [userId]
     );
-    
+
     res.json({ message: 'Usuario eliminado con éxito', success: true });
   } catch (error) {
     console.error(`Error al eliminar usuario ${userId}:`, error);
@@ -347,7 +385,7 @@ app.post('/login', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ message: 'Se requiere email y contraseña' });
   }
-  
+
   try {
     // Obtener una conexión del pool
     connection = await pool.getConnection();
@@ -368,7 +406,7 @@ app.post('/login', async (req, res) => {
     // Verificar la contraseña
     const hash = crypto.createHash('sha256').update(password).digest('hex');
     const passwordValid = hash === user.password || password === user.password;
-    
+
     if (!passwordValid) {
       return res.status(401).json({ message: 'Credenciales inválidas' });
     }
@@ -397,13 +435,13 @@ app.post('/login', async (req, res) => {
 try {
   console.log("Intentando iniciar servicio de actualización programada...");
   const { initScheduleService } = await import('./service/scheduleDataUpdates.js');
-  
+
   // Iniciar el servicio (que también hará la precarga inicial)
   await initScheduleService();
   console.log("Servicio de actualización programada iniciado correctamente");
 } catch (error) {
   console.error("Error al iniciar servicio de actualización programada:", error);
-  
+
   // Si falla el programador, al menos intentamos cargar los datos una vez
   try {
     console.log("Realizando precarga de datos fallback...");

@@ -2,21 +2,21 @@
   "name": "loker-node",
   "version": "1.0.0",
   "description": "loker server",
-  "main": "index.js",
+  "main": "server/index.js",
   "type": "module",
   "scripts": {
-    "dev": "node server/index.js", 
-    "start": "NODE_OPTIONS=--openssl-legacy-provider node server/index.js",
-    "test": "echo \"No test specified\" && exit 1"
+    "dev": "node server/index.js",
+    "start": "node server/index.js",
+    "updates": "node server/service/scheduleDataUpdates.js"
   },
   "dependencies": {
-    "@google-cloud/bigquery": "^7.9.4",
+    "@google-cloud/bigquery": "^7.5.0",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
-    "dotenv": "^16.4.7",
-    "express": "^5.1.0",
-    "mysql2": "^3.14.0",
-    "node-cron": "^3.0.3"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "mysql2": "^3.6.0",
+    "node-cron": "^3.0.2"
   },
   "devDependencies": {
     "cross-env": "^7.0.3"

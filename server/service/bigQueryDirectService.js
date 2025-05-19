@@ -1,8 +1,11 @@
+// server/service/bigQueryDirectService.js
 import { BigQuery } from '@google-cloud/bigquery';
 import 'dotenv/config';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
+import mysql from 'mysql2/promise';
 
 // Obtener la ruta del archivo actual
 const __filename = fileURLToPath(import.meta.url);
@@ -47,7 +50,6 @@ function saveCacheToFile() {
   }
 }
 
-
 // Configuración de credenciales
 const credentials = {
   type: process.env.BQ_TYPE || "service_account",
@@ -66,7 +68,6 @@ const credentials = {
 // Instanciar el cliente de BigQuery con manejo de errores
 const keyFilePath = path.join(__dirname, '../../google-credentials.json');
 console.log(`Buscando archivo de credenciales en: ${keyFilePath}`);
-
 
 let bigquery;
 try {
@@ -147,6 +148,148 @@ const agencyConfig = {
   }
 };
 
+// Función para obtener conexión a la base de datos
+const getDbConnection = async () => {
+  return await mysql.createConnection({
+    host: process.env.MYSQLHOST || process.env.HOST_DB || 'localhost',
+    port: process.env.MYSQLPORT || process.env.PORT_DB || 3306,
+    user: process.env.MYSQLUSER || process.env.USER || 'root',
+    password: process.env.MYSQLPASSWORD || process.env.PASSWORD || 'root',
+    database: process.env.MYSQLDATABASE || process.env.DATABASE || 'railway'
+  });
+};
+
+// Función para buscar datos en la caché
+async function getFromCache(agencyName, queryHash) {
+  try {
+    const connection = await getDbConnection();
+    const [rows] = await connection.execute(
+      'SELECT data, timestamp FROM query_cache WHERE cache_key = ?',
+      [`${agencyName}:${queryHash}`]
+    );
+
+    if (rows.length > 0) {
+      // Comprobar si la caché está actualizada (24 horas)
+      const cacheTime = new Date(rows[0].timestamp).getTime();
+      const now = Date.now();
+      const cacheAge = now - cacheTime;
+
+      // Si la caché es reciente (menos de 24 horas), usarla
+      if (cacheAge < CACHE_DURATION) {
+        console.log(`Caché válida encontrada para ${agencyName}, edad: ${cacheAge / 1000 / 60} minutos`);
+        await connection.end();
+        return JSON.parse(rows[0].data);
+      }
+    }
+
+    await connection.end();
+    return null;
+  } catch (error) {
+    console.error('Error al consultar caché en MySQL:', error);
+    return null;
+  }
+}
+
+// Función para guardar datos en la caché
+// Flag para saber si MySQL está disponible
+let mysqlAvailable = true;
+
+// Función para guardar datos en la caché con manejo de errores
+// Modificación para saveToCache en bigQueryDirectService.js
+async function saveToCache(agencyName, queryHash, data) {
+  // Si MySQL no está disponible, no intentar guardar
+  if (!mysqlAvailable) {
+    console.log(`MySQL no disponible, no se guardará en caché DB para ${agencyName}`);
+    return false;
+  }
+
+  try {
+    const connection = await getDbConnection();
+
+    // Guardar metadata primero (menos propenso a errores)
+    await connection.execute(
+      `INSERT INTO cache_metadata (agency, last_updated, record_count, status) 
+       VALUES (?, NOW(), ?, 'success') 
+       ON DUPLICATE KEY UPDATE last_updated = NOW(), record_count = VALUES(record_count), 
+       status = 'success', error_message = NULL`,
+      [agencyName, data.length]
+    );
+
+    // Convertir datos a JSON y comprobar tamaño
+    const jsonData = JSON.stringify(data);
+    const dataSize = Buffer.byteLength(jsonData, 'utf8');
+
+    // Si los datos son muy grandes (más de 5MB), guardar solo en caché de memoria
+    if (dataSize > 5 * 1024 * 1024) {
+      console.log(`Datos demasiado grandes para MySQL (${Math.round(dataSize / 1024 / 1024)}MB), guardando solo en caché de memoria`);
+      await connection.end();
+      return false;
+    }
+
+    // Intentar insertar en la caché
+    await connection.execute(
+      `INSERT INTO query_cache (cache_key, data, timestamp) 
+       VALUES (?, ?, NOW()) 
+       ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW()`,
+      [`${agencyName}:${queryHash}`, jsonData]
+    );
+
+    await connection.end();
+    console.log(`Caché actualizada para ${agencyName}: ${data.length} registros`);
+    return true;
+  } catch (error) {
+    console.error('Error al guardar en caché MySQL:', error);
+
+    // Marcar MySQL como no disponible después de ciertos errores
+    if (error.code === 'PROTOCOL_CONNECTION_LOST' || error.code === 'ETIMEDOUT' ||
+      error.code === 'ER_NET_PACKET_TOO_LARGE') {
+      console.warn('Error de conexión o datos muy grandes. Se usará solo caché en memoria.');
+    }
+
+    return false;
+  }
+}
+
+// Función para invalidar la caché de una agencia
+async function invalidateCacheInDb(agencyName = null) {
+  try {
+    const connection = await getDbConnection();
+
+    if (agencyName) {
+      // Eliminar caché para una agencia específica
+      await connection.execute(
+        'DELETE FROM query_cache WHERE cache_key LIKE ?',
+        [`${agencyName}:%`]
+      );
+
+      // Actualizar metadata
+      await connection.execute(
+        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW() 
+         WHERE agency = ?`,
+        [agencyName]
+      );
+
+      console.log(`Caché invalidada en DB para la agencia: ${agencyName}`);
+    } else {
+      // Eliminar toda la caché
+      await connection.execute('TRUNCATE TABLE query_cache');
+
+      // Actualizar metadata para todas las agencias
+      await connection.execute(
+        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW()`
+      );
+
+      console.log('Caché completamente invalidada en DB');
+    }
+
+    await connection.end();
+    return true;
+  } catch (error) {
+    console.error('Error al invalidar caché en DB:', error);
+    return false;
+  }
+}
+
 /**
  * Genera una consulta SQL para extraer datos de la tabla de retención
  * @param {string} agencyName - Nombre de la agencia
@@ -218,16 +361,33 @@ function generateQuery(agencyName, filters = {}) {
  * @returns {Promise<Array>} - Resultados de la consulta
  */
 async function executeQuery(projectId, query, useCache = true) {
-  // Generar clave de caché basada en la query
-  const cacheKey = `${projectId}:${query}`;
+  // Generar hash único para la consulta
+  const queryHash = crypto.createHash('md5').update(query).digest('hex');
 
-  // Verificar si hay datos en caché y si no han expirado
+  // Determinar la agencia a partir del projectId
+  const agencyEntry = Object.entries(agencyConfig).find(([_, config]) =>
+    config.projectId === projectId
+  );
+
+  const agencyName = agencyEntry ? agencyEntry[0] : 'unknown';
+
+  // Verificar si hay datos en caché DB y si no han expirado
+  if (useCache) {
+    const cachedData = await getFromCache(agencyName, queryHash);
+    if (cachedData) {
+      console.log(`Usando datos en caché de DB para: ${agencyName}`);
+      return cachedData;
+    }
+  }
+
+  // Verificar si hay datos en caché de memoria y si no han expirado
+  const cacheKey = `${projectId}:${query}`;
   if (useCache && queryCache.has(cacheKey)) {
     const cachedData = queryCache.get(cacheKey);
     const now = Date.now();
 
     if (now - cachedData.timestamp < CACHE_DURATION) {
-      console.log(`Usando datos en caché para: ${projectId}`);
+      console.log(`Usando datos en caché de memoria para: ${projectId}`);
       return cachedData.data;
     }
   }
@@ -279,13 +439,18 @@ async function executeQuery(projectId, query, useCache = true) {
       const [rows] = await tempBigQuery.query({ query });
       console.log(`Consulta exitosa en ${projectId}: ${rows.length} filas obtenidas`);
 
-      // Guardar en caché si está habilitada
+      // Guardar en caché de memoria si está habilitada
       if (useCache) {
         queryCache.set(cacheKey, {
           data: rows,
           timestamp: Date.now()
         });
         saveCacheToFile();
+      }
+
+      // Guardar en caché DB
+      if (useCache) {
+        await saveToCache(agencyName, queryHash, rows);
       }
 
       return rows;
@@ -302,6 +467,9 @@ async function executeQuery(projectId, query, useCache = true) {
           timestamp: Date.now()
         });
         saveCacheToFile();
+
+        // Guardar en caché DB
+        await saveToCache(agencyName, queryHash, rows);
       }
 
       return rows;
@@ -319,6 +487,21 @@ async function executeQuery(projectId, query, useCache = true) {
       if (error.errors && error.errors.length > 0) {
         console.error(`Detalles del error: ${error.errors[0].message}`);
       }
+    }
+
+    // Registrar error en metadata
+    try {
+      const connection = await getDbConnection();
+      await connection.execute(
+        `INSERT INTO cache_metadata (agency, last_updated, status, error_message) 
+         VALUES (?, NOW(), 'error', ?) 
+         ON DUPLICATE KEY UPDATE last_updated = NOW(), 
+         status = 'error', error_message = VALUES(error_message)`,
+        [agencyName, error.message]
+      );
+      await connection.end();
+    } catch (metaError) {
+      console.error('Error al registrar error en metadata:', metaError);
     }
 
     throw error;
@@ -383,6 +566,8 @@ async function getAgencyData(agencyName, filters = {}, useCache = true) {
 function invalidateCache(agencyName = null) {
   if (agencyName) {
     // Invalidar caché solo para una agencia específica
+    // Continuación de bigQueryDirectService.js
+
     const keyPrefix = `${agencyConfig[agencyName]?.projectId}:`;
     for (const key of queryCache.keys()) {
       if (key.startsWith(keyPrefix)) {
@@ -398,13 +583,16 @@ function invalidateCache(agencyName = null) {
 
   // Guardar cambios en el archivo
   saveCacheToFile();
+
+  // También invalidar en la base de datos
+  invalidateCacheInDb(agencyName);
 }
 
 /**
- * Precarga los datos de todas las agencias o una agencia específica
- * Esta función se puede ejecutar diariamente para actualizar la caché
- * @param {string} agencyName - Nombre de la agencia (opcional, si no se especifica se precargan todas)
- */
+* Precarga los datos de todas las agencias o una agencia específica
+* Esta función se puede ejecutar diariamente para actualizar la caché
+* @param {string} agencyName - Nombre de la agencia (opcional, si no se especifica se precargan todas)
+*/
 async function preloadAgencyData(agencyName = null) {
   try {
     // Agrupar agencias por projectId para minimizar el número de consultas
@@ -467,7 +655,6 @@ async function preloadAgencyData(agencyName = null) {
 }
 
 // Exportar funciones
-// Exportar funciones
 export {
   getAgencyData,
   preloadAgencyData,
@@ -475,5 +662,8 @@ export {
   executeQuery,
   agencyConfig,
   saveCacheToFile,
-  queryCache
+  queryCache,
+  getFromCache,
+  saveToCache,
+  getDbConnection
 };
