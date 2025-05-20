@@ -2,3 +2,7 @@
 node_modules/
 package-lock.json
 google-credentials.json
+
+test-new-connection
+test-with-retry
+verify-tables

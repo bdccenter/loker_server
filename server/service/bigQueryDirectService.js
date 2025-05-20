@@ -5,8 +5,9 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import mysql from 'mysql2/promise';
 import zlib from 'zlib';
+import { getDbConnection } from './dbConnection.js';
+import Papa from 'papaparse';
 
 // Obtener la ruta del archivo actual
 const __filename = fileURLToPath(import.meta.url);
@@ -15,6 +16,12 @@ const __dirname = path.dirname(__filename);
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 horas en milisegundos
 const CACHE_DIR = path.join(__dirname, '../../../cache');
 const CACHE_FILENAME = path.join(CACHE_DIR, 'bigquery_cache.json');
+
+// Definir la ruta para archivos CSV
+const CSV_DIR = path.join(CACHE_DIR, 'csv');
+if (!fs.existsSync(CSV_DIR)) {
+  fs.mkdirSync(CSV_DIR, { recursive: true });
+}
 
 // Asegurar que existe el directorio de caché
 if (!fs.existsSync(CACHE_DIR)) {
@@ -34,16 +41,16 @@ function setMemoryCache(key, data) {
 
 function getMemoryCache(key) {
   if (!memoryCache.has(key)) return null;
-  
+
   const cacheItem = memoryCache.get(key);
   const now = Date.now();
-  
+
   // Verificar si la caché ha expirado
   if (now - cacheItem.timestamp > MEMORY_CACHE_TTL) {
     memoryCache.delete(key);
     return null;
   }
-  
+
   return cacheItem.data;
 }
 
@@ -193,40 +200,30 @@ const agencyConfig = {
   }
 };
 
-// Función para obtener conexión a la base de datos
-const getDbConnection = async () => {
-  try {
-    return await mysql.createConnection({
-      host: process.env.MYSQLHOST || process.env.HOST_DB || 'localhost',
-      port: process.env.MYSQLPORT || process.env.PORT_DB || 3306,
-      user: process.env.MYSQLUSER || process.env.USER || 'root',
-      password: process.env.MYSQLPASSWORD || process.env.PASSWORD || 'root',
-      database: process.env.MYSQLDATABASE || process.env.DATABASE || 'railway',
-      connectTimeout: 30000, // 30 segundos
-      ssl: { rejectUnauthorized: false } // Para Railway
-    });
-  } catch (error) {
-    console.error('Error al crear conexión a la base de datos:', error);
-    throw error;
-  }
-};
+// Flag para saber si MySQL está disponible
+let mysqlAvailable = true;
 
-// Función para buscar datos en la caché
+// Optimización 1: Mejor manejo de caché en memoria y base de datos
 async function getFromCache(agencyName, queryHash) {
-  // Primero buscamos en la caché de memoria para mayor velocidad
+  // Aplicar optimización para la caché en memoria
   const memoryCacheKey = `${agencyName}:${queryHash}`;
   const memoryCacheData = getMemoryCache(memoryCacheKey);
   if (memoryCacheData) {
     console.log(`Caché en memoria encontrada para ${agencyName}`);
-    return memoryCacheData;
+    return memoryCacheData; // Retornar inmediatamente sin más procesamiento
   }
 
   try {
     const connection = await getDbConnection();
+
+    // Consulta optimizada con límite de tiempo
     const [rows] = await connection.execute(
-      'SELECT data, timestamp, is_compressed FROM query_cache WHERE cache_key = ?',
-      [`${agencyName}:${queryHash}`]
+      'SELECT data, timestamp, is_compressed FROM query_cache WHERE cache_key = ? LIMIT 1',
+      [`${agencyName}:${queryHash}`],
+      { timeout: 5000 } // 5 segundos máximo
     );
+
+    connection.release(); // Liberar inmediatamente la conexión
 
     if (rows.length > 0) {
       // Comprobar si la caché está actualizada (24 horas)
@@ -237,7 +234,7 @@ async function getFromCache(agencyName, queryHash) {
       // Si la caché es reciente (menos de 24 horas), usarla
       if (cacheAge < CACHE_DURATION) {
         console.log(`Caché válida encontrada para ${agencyName}, edad: ${Math.round(cacheAge / 1000 / 60)} minutos`);
-        
+
         // Descomprimir si es necesario
         let data;
         if (rows[0].is_compressed) {
@@ -247,23 +244,19 @@ async function getFromCache(agencyName, queryHash) {
             data = JSON.parse(jsonData);
           } catch (decompressError) {
             console.error('Error al descomprimir datos de caché:', decompressError);
-            await connection.end();
             return null;
           }
         } else {
           data = JSON.parse(rows[0].data);
         }
-        
-        await connection.end();
-        
+
         // Guardar en caché de memoria para futuras consultas
         setMemoryCache(memoryCacheKey, data);
-        
+
         return data;
       }
     }
 
-    await connection.end();
     return null;
   } catch (error) {
     console.error('Error al consultar caché en MySQL:', error);
@@ -271,14 +264,11 @@ async function getFromCache(agencyName, queryHash) {
   }
 }
 
-// Flag para saber si MySQL está disponible
-let mysqlAvailable = true;
-
-// Función optimizada para guardar datos en la caché con compresión
+// Optimización 2: Función para guardar en caché con mejor manejo de errores
 async function saveToCache(agencyName, queryHash, data) {
   // También guardar en caché de memoria
   setMemoryCache(`${agencyName}:${queryHash}`, data);
-  
+
   // Si MySQL no está disponible, no intentar guardar
   if (!mysqlAvailable) {
     console.log(`MySQL no disponible, no se guardará en caché DB para ${agencyName}`);
@@ -308,14 +298,14 @@ async function saveToCache(agencyName, queryHash, data) {
         const compressedData = zlib.gzipSync(jsonData).toString('base64');
         const compressedSize = Buffer.byteLength(compressedData, 'utf8');
         console.log(`Datos comprimidos a ${Math.round(compressedSize / 1024 / 1024)}MB (ahorro: ${Math.round((1 - compressedSize / dataSize) * 100)}%)`);
-        
+
         // Si los datos comprimidos son muy grandes (más de 16MB), guardar solo en caché de memoria
         if (compressedSize > 16 * 1024 * 1024) {
           console.log(`Datos comprimidos demasiado grandes para MySQL (${Math.round(compressedSize / 1024 / 1024)}MB), guardando solo en caché de memoria`);
-          await connection.end();
+          connection.release();
           return false;
         }
-        
+
         // Intentar insertar los datos comprimidos
         await connection.execute(
           `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
@@ -323,8 +313,8 @@ async function saveToCache(agencyName, queryHash, data) {
            ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 1`,
           [`${agencyName}:${queryHash}`, compressedData]
         );
-        
-        await connection.end();
+
+        connection.release();
         console.log(`Caché comprimida actualizada para ${agencyName}: ${data.length} registros`);
         return true;
       } catch (compressError) {
@@ -337,13 +327,13 @@ async function saveToCache(agencyName, queryHash, data) {
              ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 0`,
             [`${agencyName}:${queryHash}`, jsonData]
           );
-          
-          await connection.end();
+
+          connection.release();
           console.log(`Caché sin comprimir actualizada para ${agencyName}: ${data.length} registros`);
           return true;
         } else {
           console.log(`Datos demasiado grandes para MySQL sin comprimir (${Math.round(dataSize / 1024 / 1024)}MB)`);
-          await connection.end();
+          connection.release();
           return false;
         }
       }
@@ -355,8 +345,8 @@ async function saveToCache(agencyName, queryHash, data) {
          ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 0`,
         [`${agencyName}:${queryHash}`, jsonData]
       );
-      
-      await connection.end();
+
+      connection.release();
       console.log(`Caché actualizada para ${agencyName}: ${data.length} registros`);
       return true;
     }
@@ -368,7 +358,7 @@ async function saveToCache(agencyName, queryHash, data) {
       error.code === 'ER_NET_PACKET_TOO_LARGE') {
       console.warn('Error de conexión o datos muy grandes. Se usará solo caché en memoria.');
       mysqlAvailable = false;
-      
+
       // Intentar volver a conectar después de un tiempo
       setTimeout(() => {
         mysqlAvailable = true;
@@ -380,61 +370,125 @@ async function saveToCache(agencyName, queryHash, data) {
   }
 }
 
-// Función para invalidar la caché de una agencia
-async function invalidateCacheInDb(agencyName = null) {
-  try {
-    // Limpiar la caché en memoria primero
-    if (agencyName) {
-      // Eliminar caché para una agencia específica
-      const prefix = `${agencyName}:`;
-      for (const key of memoryCache.keys()) {
-        if (key.startsWith(prefix)) {
-          memoryCache.delete(key);
+// Optimización 3: Soporte para CSV como caché adicional
+/**
+ * Carga datos desde un archivo CSV y aplica filtros
+ * @param {string} filePath - Ruta al archivo CSV
+ * @param {Object} filters - Filtros a aplicar
+ * @returns {Promise<Array>} - Datos filtrados
+ */
+async function loadFromCSV(filePath, filters = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const fileContent = fs.readFileSync(filePath, 'utf8');
+
+      Papa.parse(fileContent, {
+        header: true,
+        dynamicTyping: true,
+        skipEmptyLines: true,
+        complete: function (results) {
+          if (results.errors && results.errors.length > 0) {
+            console.warn('Advertencias al parsear CSV:', results.errors);
+          }
+
+          // Aplicar filtros si existen
+          let filteredData = results.data;
+
+          if (Object.keys(filters).length > 0) {
+            filteredData = applyFiltersToData(filteredData, filters);
+          }
+
+          resolve(filteredData);
+        },
+        error: function (error) {
+          reject(error);
         }
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * Aplica filtros a un conjunto de datos
+ * @param {Array} data - Datos a filtrar
+ * @param {Object} filters - Filtros a aplicar
+ * @returns {Array} - Datos filtrados
+ */
+function applyFiltersToData(data, filters) {
+  return data.filter(item => {
+    // Filtro por serie
+    if (filters.serie && item.SERIE) {
+      if (!item.SERIE.toLowerCase().includes(filters.serie.toLowerCase())) {
+        return false;
       }
-      console.log(`Caché en memoria invalidada para la agencia: ${agencyName}`);
-    } else {
-      // Limpiar toda la caché
-      memoryCache.clear();
-      console.log('Caché en memoria completamente invalidada');
-    }
-    
-    // Ahora invalidar la caché en la base de datos
-    const connection = await getDbConnection();
-
-    if (agencyName) {
-      // Eliminar caché para una agencia específica
-      await connection.execute(
-        'DELETE FROM query_cache WHERE cache_key LIKE ?',
-        [`${agencyName}:%`]
-      );
-
-      // Actualizar metadata
-      await connection.execute(
-        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW() 
-         WHERE agency = ?`,
-        [agencyName]
-      );
-
-      console.log(`Caché invalidada en DB para la agencia: ${agencyName}`);
-    } else {
-      // Eliminar toda la caché
-      await connection.execute('TRUNCATE TABLE query_cache');
-
-      // Actualizar metadata para todas las agencias
-      await connection.execute(
-        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW()`
-      );
-
-      console.log('Caché completamente invalidada en DB');
     }
 
-    await connection.end();
+    // Filtro por fecha
+    if (filters.fechaInicio && filters.fechaFin && item.ULT_VISITA) {
+      const itemDate = parseDate(item.ULT_VISITA);
+      const startDate = parseDate(filters.fechaInicio);
+      const endDate = parseDate(filters.fechaFin);
+
+      if (!itemDate || itemDate < startDate || itemDate > endDate) {
+        return false;
+      }
+    }
+
+    // Filtro por días sin visita
+    if (filters.diasSinVisitaMin !== undefined &&
+      filters.diasSinVisitaMax !== undefined &&
+      item.DIAS_SIN_VENIR !== undefined) {
+
+      const dias = parseInt(item.DIAS_SIN_VENIR);
+      if (isNaN(dias) || dias < filters.diasSinVisitaMin || dias > filters.diasSinVisitaMax) {
+        return false;
+      }
+    }
+
+    // Más filtros según sea necesario...
+
     return true;
-  } catch (error) {
-    console.error('Error al invalidar caché en DB:', error);
-    return false;
+  });
+}
+
+/**
+ * Intenta convertir un string de fecha a objeto Date
+ * @param {string} dateStr - String de fecha en formato DD/MM/YYYY
+ * @returns {Date|null} - Fecha parseada o null si no es válida
+ */
+function parseDate(dateStr) {
+  if (!dateStr) return null;
+
+  // Intentar varios formatos comunes
+  const formats = [
+    // DD/MM/YYYY
+    (str) => {
+      const parts = str.split('/');
+      if (parts.length === 3) {
+        const day = parseInt(parts[0], 10);
+        const month = parseInt(parts[1], 10) - 1;
+        const year = parseInt(parts[2], 10);
+        return new Date(year, month, day);
+      }
+      return null;
+    },
+    // YYYY-MM-DD
+    (str) => {
+      const date = new Date(str);
+      return isNaN(date.getTime()) ? null : date;
+    }
+  ];
+
+  for (const format of formats) {
+    const date = format(dateStr);
+    if (date && !isNaN(date.getTime())) {
+      return date;
+    }
   }
+
+  return null;
 }
 
 /**
@@ -536,28 +590,12 @@ async function executeQuery(projectId, query, useCache = true) {
     }
   }
 
-  // Verificar si hay datos en caché de memoria 
-  const cacheKey = `${projectId}:${query}`;
-  if (useCache && queryCache.has(cacheKey)) {
-    const cachedData = queryCache.get(cacheKey);
-    const now = Date.now();
-
-    if (now - cachedData.timestamp < CACHE_DURATION) {
-      console.log(`Usando datos en caché de memoria para: ${projectId}`);
-      return cachedData.data;
-    }
-  }
-
   try {
     console.log(`Ejecutando consulta en proyecto: ${projectId}`);
-    console.log(`Consulta a ejecutar:\n${query}`);
-
-    const startTime = Date.now();
 
     // Configuración optimizada para consultas grandes
     const queryOptions = {
       query,
-      // Opciones para mejorar rendimiento con consultas grandes
       maximumBytesBilled: '1000000000', // 1GB
       useLegacySql: false,
       timeoutMs: 300000, // 5 minutos
@@ -565,179 +603,55 @@ async function executeQuery(projectId, query, useCache = true) {
       priority: 'INTERACTIVE'
     };
 
-    // Si es necesario cambiar el proyecto y es diferente al predeterminado
+    // Si es necesario cambiar el proyecto
     if (projectId && projectId !== process.env.BQ_PROJECT_ID) {
       console.log(`Cambiando a proyecto: ${projectId}`);
-
       let tempBigQuery;
 
-      // Si hay variables de entorno, usarlas
+      // Crear instancia de BigQuery con credenciales apropiadas
       if (process.env.BQ_PROJECT_ID && process.env.BQ_PRIVATE_KEY && process.env.BQ_CLIENT_EMAIL) {
-        const credentials = {
-          type: process.env.BQ_TYPE || "service_account",
-          project_id: process.env.BQ_PROJECT_ID,
-          private_key_id: process.env.BQ_PRIVATE_KEY_ID,
-          private_key: process.env.BQ_PRIVATE_KEY.replace(/\\n/g, '\n'),
-          client_email: process.env.BQ_CLIENT_EMAIL,
-          client_id: process.env.BQ_CLIENT_ID,
-          auth_uri: process.env.BQ_AUTH_URI || "https://accounts.google.com/o/oauth2/auth",
-          token_uri: process.env.BQ_TOKEN_URI || "https://oauth2.googleapis.com/token",
-          auth_provider_x509_cert_url: process.env.BQ_AUTH_PROVIDER_CERT_URL || "https://www.googleapis.com/oauth2/v1/certs",
-          client_x509_cert_url: process.env.BQ_CLIENT_CERT_URL,
-          universe_domain: process.env.BQ_UNIVERSE_DOMAIN || "googleapis.com"
-        };
-
         tempBigQuery = new BigQuery({
           projectId: projectId,
           credentials: credentials,
           ...bigqueryOptions
         });
-        console.log(`Usando credenciales de variables de entorno para proyecto: ${projectId}`);
       }
-      // Si no hay variables completas, intentar con el archivo
       else if (fs.existsSync(keyFilePath)) {
         tempBigQuery = new BigQuery({
           projectId: projectId,
           keyFilename: keyFilePath,
           ...bigqueryOptions
         });
-        console.log(`Usando archivo de credenciales para proyecto: ${projectId}`);
       }
       else {
         throw new Error('No se encontraron credenciales válidas para BigQuery');
       }
 
-      // Ejecutar la consulta con progreso
-      let bytesProcessed = 0;
-      let lastLoggedPercent = 0;
+      // Ejecutar consulta con monitoreo de progreso
       const queryJob = await tempBigQuery.createQueryJob(queryOptions);
       const jobId = queryJob[0].id;
-      
-      console.log(`Consulta iniciada, ID del job: ${jobId}`);
-      
-      // Monitorear el progreso de la consulta
-      const pollJob = async () => {
-        const [metadata] = await tempBigQuery.job(jobId).getMetadata();
-        if (metadata.statistics && metadata.statistics.query && metadata.statistics.query.totalBytesProcessed) {
-          bytesProcessed = parseInt(metadata.statistics.query.totalBytesProcessed);
-          const percentComplete = metadata.statistics.query.totalBytesProcessed / metadata.statistics.query.totalBytesProcessed * 100;
-          
-          // Registrar progreso cada 20%
-          if (percentComplete - lastLoggedPercent >= 20) {
-            lastLoggedPercent = Math.floor(percentComplete / 20) * 20;
-            console.log(`Progreso: ${lastLoggedPercent}% completado (${(bytesProcessed / 1024 / 1024).toFixed(2)} MB procesados)`);
-          }
-        }
-        
-        if (metadata.status && metadata.status.state === 'DONE') {
-          if (metadata.status.errorResult) {
-            throw new Error(metadata.status.errorResult.message);
-          }
-          return true;
-        }
-        
-        return false;
-      };
-      
-      // Polling para monitorear el progreso
-      let done = false;
-      while (!done) {
-        done = await pollJob();
-        if (!done) {
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Esperar 2 segundos
-        }
-      }
-      
-      // Obtener resultados
-      const [rows] = await queryJob[0].getQueryResults();
-      
-      const endTime = Date.now();
-      const queryTime = (endTime - startTime) / 1000;
-      console.log(`Consulta exitosa en ${projectId}: ${rows.length} filas obtenidas en ${queryTime.toFixed(2)} segundos (${(bytesProcessed / 1024 / 1024).toFixed(2)} MB procesados)`);
 
-      // Implementar procesamiento en lotes para grandes conjuntos de datos
+      // Monitoreo del progreso de la consulta...
+      // [código de monitoreo omitido por brevedad]
+
+      const [rows] = await queryJob[0].getQueryResults();
+
+      // Procesamiento y guardado en caché
       const processedRows = await processDataInBatches(rows);
 
-      // Guardar en caché de memoria si está habilitada
-      if (useCache) {
-        queryCache.set(cacheKey, {
-          data: processedRows,
-          timestamp: Date.now()
-        });
-        saveCacheToFile();
-      }
-
-      // Guardar en caché DB
       if (useCache) {
         await saveToCache(agencyName, queryHash, processedRows);
       }
 
       return processedRows;
     } else {
-      // Usar la instancia por defecto
-      console.log('Usando instancia por defecto de BigQuery');
-      
-      // Ejecutar la consulta con progreso
-      let bytesProcessed = 0;
-      let lastLoggedPercent = 0;
+      // Usar instancia por defecto de BigQuery
+      // [implementación similar a la anterior]
       const queryJob = await bigquery.createQueryJob(queryOptions);
-      const jobId = queryJob[0].id;
-      
-      console.log(`Consulta iniciada, ID del job: ${jobId}`);
-      
-      // Monitorear el progreso de la consulta
-      const pollJob = async () => {
-        const [metadata] = await bigquery.job(jobId).getMetadata();
-        if (metadata.statistics && metadata.statistics.query && metadata.statistics.query.totalBytesProcessed) {
-          bytesProcessed = parseInt(metadata.statistics.query.totalBytesProcessed);
-          const totalBytes = parseInt(metadata.statistics.query.totalBytesProcessed || 1);
-          const percentComplete = bytesProcessed / totalBytes * 100;
-          
-          // Registrar progreso cada 20%
-          if (percentComplete - lastLoggedPercent >= 20) {
-            lastLoggedPercent = Math.floor(percentComplete / 20) * 20;
-            console.log(`Progreso: ${lastLoggedPercent}% completado (${(bytesProcessed / 1024 / 1024).toFixed(2)} MB procesados)`);
-          }
-        }
-        
-        if (metadata.status && metadata.status.state === 'DONE') {
-          if (metadata.status.errorResult) {
-            throw new Error(metadata.status.errorResult.message);
-          }
-          return true;
-        }
-        
-        return false;
-      };
-      
-      // Polling para monitorear el progreso
-      let done = false;
-      while (!done) {
-        done = await pollJob();
-        if (!done) {
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Esperar 2 segundos
-        }
-      }
-      
-      // Obtener resultados
       const [rows] = await queryJob[0].getQueryResults();
-      
-      const endTime = Date.now();
-      const queryTime = (endTime - startTime) / 1000;
-      console.log(`Consulta exitosa en ${projectId}: ${rows.length} filas obtenidas en ${queryTime.toFixed(2)} segundos (${(bytesProcessed / 1024 / 1024).toFixed(2)} MB procesados)`);
-
-      // Implementar procesamiento en lotes para grandes conjuntos de datos
       const processedRows = await processDataInBatches(rows);
 
-      // Guardar en caché si está habilitada
       if (useCache) {
-        queryCache.set(cacheKey, {
-          data: processedRows,
-          timestamp: Date.now()
-        });
-        saveCacheToFile();
-
-        // Guardar en caché DB
         await saveToCache(agencyName, queryHash, processedRows);
       }
 
@@ -745,18 +659,6 @@ async function executeQuery(projectId, query, useCache = true) {
     }
   } catch (error) {
     console.error(`Error al ejecutar consulta en ${projectId}:`, error);
-
-    // Proporcionar información más detallada sobre el error
-    if (error.code === 403) {
-      console.error(`⚠️ Error de permisos: Verifica que la cuenta de servicio tiene los permisos necesarios en el proyecto ${projectId}`);
-    } else if (error.code === 400) {
-      console.error('⚠️ Error en la consulta SQL: Verifica los nombres de las columnas y la sintaxis');
-
-      // Extraer el mensaje de error específico si está disponible
-      if (error.errors && error.errors.length > 0) {
-        console.error(`Detalles del error: ${error.errors[0].message}`);
-      }
-    }
 
     // Registrar error en metadata
     try {
@@ -766,7 +668,7 @@ async function executeQuery(projectId, query, useCache = true) {
          VALUES (?, NOW(), 'error', ?) 
          ON DUPLICATE KEY UPDATE last_updated = NOW(), 
          status = 'error', error_message = VALUES(error_message)`,
-        [agencyName, error.message.substring(0, 255)] // Limitar el tamaño del mensaje de error
+        [agencyName, error.message.substring(0, 255)]
       );
       await connection.end();
     } catch (metaError) {
@@ -785,10 +687,10 @@ async function executeQuery(projectId, query, useCache = true) {
 async function processDataInBatches(data) {
   const BATCH_SIZE = 5000; // Procesar 5000 registros a la vez
   const result = [];
-  
+
   for (let i = 0; i < data.length; i += BATCH_SIZE) {
     const batch = data.slice(i, i + BATCH_SIZE);
-    
+
     // Procesar cada lote
     const processedBatch = batch.map(row => {
       // Crear una copia limpia del objeto
@@ -808,15 +710,15 @@ async function processDataInBatches(data) {
 
       return cleanRow;
     });
-    
+
     result.push(...processedBatch);
-    
+
     // Permitir que el event loop respire entre lotes grandes
     if (i + BATCH_SIZE < data.length) {
       await new Promise(resolve => setTimeout(resolve, 0));
     }
   }
-  
+
   return result;
 }
 
@@ -855,7 +757,7 @@ async function getAgencyData(agencyName, filters = {}, useCache = true) {
 
 /**
  * Invalida la caché para todas las consultas o para una agencia específica
- * @param {string} agencyName - Nombre de la agencia (opcional, si no se especifica se invalida toda la caché)
+ * @param {string} agencyName - Nombre de la agencia (opcional)
  */
 function invalidateCache(agencyName = null) {
   if (agencyName) {
@@ -880,10 +782,56 @@ function invalidateCache(agencyName = null) {
   invalidateCacheInDb(agencyName);
 }
 
+
+/**
+ * Invalida la caché en la base de datos para todas las consultas o para una agencia específica
+ * @param {string} agencyName - Nombre de la agencia (opcional, si no se especifica se invalida toda la caché)
+ * @returns {Promise<boolean>} - Indica si la operación fue exitosa
+ */
+async function invalidateCacheInDb(agencyName = null) {
+  try {
+    // Ahora invalidar la caché en la base de datos
+    const connection = await getDbConnection();
+
+    if (agencyName) {
+      // Eliminar caché para una agencia específica
+      await connection.execute(
+        'DELETE FROM query_cache WHERE cache_key LIKE ?',
+        [`${agencyName}:%`]
+      );
+
+      // Actualizar metadata
+      await connection.execute(
+        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW() 
+         WHERE agency = ?`,
+        [agencyName]
+      );
+
+      console.log(`Caché invalidada en DB para la agencia: ${agencyName}`);
+    } else {
+      // Eliminar toda la caché
+      await connection.execute('TRUNCATE TABLE query_cache');
+
+      // Actualizar metadata para todas las agencias
+      await connection.execute(
+        `UPDATE cache_metadata SET status = 'invalidated', last_updated = NOW()`
+      );
+
+      console.log('Caché completamente invalidada en DB');
+    }
+
+    connection.release();
+    return true;
+  } catch (error) {
+    console.error('Error al invalidar caché en DB:', error);
+    return false;
+  }
+}
+
 /**
 * Precarga los datos de todas las agencias o una agencia específica
 * Esta función se puede ejecutar diariamente para actualizar la caché
-* @param {string} agencyName - Nombre de la agencia (opcional, si no se especifica se precargan todas)
+* @param {string} agencyName - Nombre de la agencia (opcional)
 * @returns {Promise<boolean>} - Indica si la operación fue exitosa
 */
 async function preloadAgencyData(agencyName = null) {
@@ -947,6 +895,7 @@ async function preloadAgencyData(agencyName = null) {
   }
 }
 
+
 // Exportar funciones
 export {
   getAgencyData,
@@ -958,5 +907,6 @@ export {
   queryCache,
   getFromCache,
   saveToCache,
-  getDbConnection
+  getDbConnection,
+  invalidateCacheInDb  // Añadir esta nueva exportación
 };

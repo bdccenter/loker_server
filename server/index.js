@@ -1,4 +1,6 @@
-// server/index.js - Versión ES modules
+// server/index.js
+
+// Importaciones existentes
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -9,13 +11,15 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { initializeDatabase } from './service/dbInitService.js';
 
+// Nuevas importaciones
+import compression from 'compression';
+import zlib from 'zlib';
 
 // Cargar variables de entorno
 dotenv.config();
 
 // Importar servicios BigQuery
-import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache } from './service/bigQueryDirectService.js';
-
+import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache, getFromCache } from './service/bigQueryDirectService.js';
 
 // Obtener la ruta del archivo actual (necesario en ES modules)
 const __filename = fileURLToPath(import.meta.url);
@@ -37,12 +41,17 @@ if (!fs.existsSync(CACHE_DIR)) {
 const app = express();
 const port = process.env.PORT || 3001;
 
+// Aplicar middleware de compresión para todas las respuestas
+app.use(compression({
+  level: zlib.constants.Z_BEST_COMPRESSION,
+  threshold: 0 // Comprimir todas las respuestas sin importar el tamaño
+}));
+
 // Configuración CORS básica
 app.use(cors());
 
 // Middleware para parsear JSON
 app.use(express.json());
-
 
 try {
   console.log("Inicializando tablas de base de datos...");
@@ -75,55 +84,115 @@ app.get('/api/test', (req, res) => {
   res.json({ message: 'Servidor funcionando correctamente' });
 });
 
-// Endpoint para obtener datos de una agencia específica
+// Endpoint para obtener datos de una agencia específica con caché HTTP
 app.get('/api/data/:agencyName', async (req, res) => {
   try {
     const { agencyName } = req.params;
-    // Convertir query params a filtros
     const filters = req.query;
     console.log(`Solicitud de datos para agencia: ${agencyName}, filtros:`, filters);
 
+    // Configurar cabeceras de caché HTTP
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
+    
+    // Generar un ETag basado en la agencia y los filtros
+    const etagBase = JSON.stringify({ agencyName, filters });
+    const etag = `"${crypto.createHash('md5').update(etagBase).digest('hex')}"`;
+    res.setHeader('ETag', etag);
+    
+    // Comprobar si podemos devolver 304 Not Modified
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      return res.status(304).end();
+    }
+
     // Forzar el uso de caché siempre que sea posible
-    const useCache = true;
+    const useCache = filters.useCache !== 'false';
 
     const data = await getAgencyData(agencyName, filters, useCache);
     console.log(`Datos obtenidos para ${agencyName}: ${data.length} registros`);
 
     res.json(data);
-  } catch (error) { // Manejo de errores
+  } catch (error) {
     console.error('Error en endpoint /api/data:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Agregar un endpoint para ver estadísticas de caché
-app.get('/api/cache/stats', async (req, res) => {
+// Nuevo endpoint para datos paginados
+app.get('/api/data/:agencyName/paginated', async (req, res) => {
   try {
-    const connection = await mysql.createConnection({
-      host: process.env.MYSQLHOST || process.env.HOST_DB || 'localhost',
-      port: process.env.MYSQLPORT || process.env.PORT_DB || 3306,
-      user: process.env.MYSQLUSER || process.env.USER || 'root',
-      password: process.env.MYSQLPASSWORD || process.env.PASSWORD || 'root',
-      database: process.env.MYSQLDATABASE || process.env.DATABASE || 'railway'
-    });
-
-    const [metadata] = await connection.execute('SELECT * FROM cache_metadata');
-    const [cacheInfo] = await connection.execute('SELECT COUNT(*) as total, MAX(timestamp) as last_update FROM query_cache');
-
-    await connection.end();
-
+    const { agencyName } = req.params;
+    const start = parseInt(req.query.start || '0', 10);
+    const limit = parseInt(req.query.limit || '100', 10);
+    const useCache = req.query.useCache !== 'false';
+    
+    console.log(`Solicitud de datos paginados para agencia: ${agencyName}, inicio: ${start}, límite: ${limit}`);
+    
+    // Configurar cabeceras de caché HTTP
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
+    
+    // Extraer filtros de los query params
+    const filters = { ...req.query };
+    delete filters.start;
+    delete filters.limit;
+    delete filters.useCache;
+    
+    // Intentar obtener datos completos desde la caché
+    let allData;
+    
+    try {
+      // Generar un hash para la consulta sin paginación
+      const baseQueryHash = crypto.createHash('md5').update(JSON.stringify(filters)).digest('hex');
+      const allDataCacheKey = `${agencyName}:${baseQueryHash}`;
+      
+      // Buscar en caché primero
+      allData = await getFromCache(agencyName, baseQueryHash);
+      
+      if (!allData) {
+        // Si no está en caché, obtener datos completos
+        allData = await getAgencyData(agencyName, filters, useCache);
+      }
+    } catch (cacheError) {
+      console.error('Error al obtener datos completos:', cacheError);
+      
+      // Si falla la caché, cargar los datos normalmente
+      allData = await getAgencyData(agencyName, filters, useCache);
+    }
+    
+    // Si no hay datos, devolver array vacío
+    if (!allData || allData.length === 0) {
+      return res.json({
+        data: [],
+        total: 0,
+        page: 1,
+        pageSize: limit,
+        totalPages: 0
+      });
+    }
+    
+    // Calcular información de paginación
+    const totalItems = allData.length;
+    const totalPages = Math.ceil(totalItems / limit);
+    const currentPage = Math.floor(start / limit) + 1;
+    
+    // Obtener solo la porción solicitada
+    const paginatedData = allData.slice(start, start + limit);
+    
+    // Enviar respuesta con metadatos de paginación
     res.json({
-      metadata,
-      cacheInfo: cacheInfo[0]
+      data: paginatedData,
+      total: totalItems,
+      page: currentPage,
+      pageSize: limit,
+      totalPages: totalPages
     });
   } catch (error) {
-    console.error('Error al obtener estadísticas de caché:', error);
+    console.error('Error en endpoint de datos paginados:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-
-// Añadir el resto de endpoints de BigQuery
+// Agregar el resto de endpoints de BigQuery
 app.post('/api/cache/invalidate/:agencyName', (req, res) => {
   try { // Endpoint para invalidar caché de una agencia específica
     const { agencyName } = req.params;
@@ -428,6 +497,32 @@ app.post('/login', async (req, res) => {
     res.status(500).json({ message: 'Error en el servidor' });
   } finally {
     if (connection) connection.release();
+  }
+});
+
+// Agregar un endpoint para ver estadísticas de caché
+app.get('/api/cache/stats', async (req, res) => {
+  try {
+    const connection = await mysql.createConnection({
+      host: process.env.MYSQLHOST || process.env.HOST_DB || 'localhost',
+      port: process.env.MYSQLPORT || process.env.PORT_DB || 3306,
+      user: process.env.MYSQLUSER || process.env.USER || 'root',
+      password: process.env.MYSQLPASSWORD || process.env.PASSWORD || 'root',
+      database: process.env.MYSQLDATABASE || process.env.DATABASE || 'railway'
+    });
+
+    const [metadata] = await connection.execute('SELECT * FROM cache_metadata');
+    const [cacheInfo] = await connection.execute('SELECT COUNT(*) as total, MAX(timestamp) as last_update FROM query_cache');
+
+    await connection.end();
+
+    res.json({
+      metadata,
+      cacheInfo: cacheInfo[0]
+    });
+  } catch (error) {
+    console.error('Error al obtener estadísticas de caché:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
