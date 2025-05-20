@@ -53,9 +53,9 @@ app.use(cors());
 // Middleware para parsear JSON
 app.use(express.json());
 
-try {
+try { // Incializador de base de datos
   console.log("Inicializando tablas de base de datos...");
-  await initializeDatabase();
+  await initializeDatabase(); 
   console.log("Base de datos inicializada correctamente");
 } catch (error) {
   console.error("Error al inicializar la base de datos:", error);
