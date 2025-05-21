@@ -243,24 +243,20 @@ async function getFromCache(agencyName, queryHash) {
       const cacheAge = now - cacheTime;
 
       // Protección contra diferencias de tiempo negativas (posibles problemas de zona horaria)
-      // Protección contra diferencias de tiempo negativas o fechas muy futuras
-      if (cacheAge < 0 || new Date(cacheTime).getFullYear() > 2100) {
-        console.error(`Error: Problema con timestamp detectado`, {
+      if (cacheAge < 0) {
+        console.error(`Error: Diferencia de tiempo negativa detectada (${cacheAge} ms)`, {
           cacheTime: new Date(cacheTime).toISOString(),
-          now: new Date(now).toISOString(),
-          diferencia: cacheAge,
-          año: new Date(cacheTime).getFullYear()
+          now: new Date(now).toISOString()
         });
 
-        // Invalidar esta caché problemática
+        // Invalidar esta caché
         try {
           await invalidateCacheInDb(agencyName);
-          console.log(`Caché con timestamp problemático invalidada automáticamente para ${agencyName}`);
         } catch (e) {
           console.error('Error al invalidar caché con timestamp incorrecto:', e);
         }
 
-        return null; // No usar caché con diferencias negativas o fechas futuras
+        return null; // No usar caché con diferencias negativas
       }
 
       // Si la caché es reciente (menos de 24 horas), usarla
@@ -313,15 +309,7 @@ async function saveToCache(agencyName, queryHash, data) {
 
     // Verificar que estamos guardando un timestamp válido y razonable
     const now = new Date();
-    const maxAllowedYear = now.getFullYear() + 1; // Permitir máximo un año en el futuro
-    if (!isValidDate(now)) {
-      console.error(`Timestamp del sistema inválido detectado: ${now.toISOString()}`);
-      // Intentar obtener una fecha válida
-      const systemDate = new Date();
-      console.log(`Usando fecha alternativa: ${systemDate.toISOString()}`);
-      // Continuar usando systemDate en lugar de now en el resto de la función
-    }
-
+    
     // Verificación del timestamp actual
     if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
       console.error(`Timestamp inválido detectado (${now.toISOString()}), ajustando a fecha del sistema`);
@@ -501,22 +489,6 @@ async function loadFromCSV(filePath, filters = {}) {
       reject(error);
     }
   });
-}
-
-/**
- * Verifica si una fecha es válida y está dentro de un rango razonable
- * @param {Date|string|number} date - Fecha a verificar
- * @returns {boolean} - true si la fecha es válida
- */
-function isValidDate(date) {
-  if (!date) return false;
-
-  const dateObj = date instanceof Date ? date : new Date(date);
-  const currentYear = new Date().getFullYear();
-
-  return !isNaN(dateObj.getTime()) &&
-    dateObj.getFullYear() >= 2020 &&
-    dateObj.getFullYear() <= currentYear + 1;
 }
 
 /**
@@ -970,10 +942,9 @@ async function invalidateCacheInDb(agencyName = null) {
 * Precarga los datos de todas las agencias o una agencia específica
 * Esta función se puede ejecutar diariamente para actualizar la caché
 * @param {string} agencyName - Nombre de la agencia (opcional)
-* @param {boolean} forceUpdate - Si se debe forzar actualización ignorando caché (default: false)
 * @returns {Promise<boolean>} - Indica si la operación fue exitosa
 */
-async function preloadAgencyData(agencyName = null, forceUpdate = false) {
+async function preloadAgencyData(agencyName = null) {
   try {
     // Agrupar agencias por projectId para minimizar el número de consultas
     const projectGroups = {};
@@ -986,7 +957,7 @@ async function preloadAgencyData(agencyName = null, forceUpdate = false) {
       invalidateCache(agencyName);
 
       // Precargar con consulta básica (sin filtros)
-      await getAgencyData(agencyName, {}, !forceUpdate, forceUpdate);
+      await getAgencyData(agencyName, {}, true);
 
       console.log(`Precarga completada para: ${agencyName}`);
       // Guardar caché
@@ -1016,7 +987,7 @@ async function preloadAgencyData(agencyName = null, forceUpdate = false) {
       // Para cada agencia en este proyecto
       for (const agency of agencies) {
         console.log(`- Procesando agencia: ${agency}`);
-        await getAgencyData(agency, {}, !forceUpdate, forceUpdate);
+        await getAgencyData(agency, {}, true);
       }
 
       // Pausa breve entre cada proyecto
