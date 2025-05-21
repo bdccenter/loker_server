@@ -494,10 +494,11 @@ function parseDate(dateStr) {
 /**
  * Genera una consulta SQL optimizada para extraer datos completos
  * @param {string} agencyName - Nombre de la agencia
- * @param {Object} filters - Filtros opcionales a aplicar (opcional)
+ * @param {Object} filters - Filtros opcionales a aplicar
+ * @param {boolean} forceNoCache - Si es true, añade un hint para evitar el uso de caché de BigQuery
  * @returns {string} - Consulta SQL generada
  */
-function generateQuery(agencyName, filters = {}) {
+function generateQuery(agencyName, filters = {}, forceNoCache = false) {
   const config = agencyConfig[agencyName];
   if (!config) throw new Error(`Configuración no encontrada para la agencia: ${agencyName}`);
 
@@ -548,8 +549,11 @@ function generateQuery(agencyName, filters = {}) {
   // Orden de resultados
   const orderClause = `ORDER BY ${dateField} DESC`;
 
+  // Agregar hint para evitar caché de BigQuery si se solicita
+  const cacheHint = forceNoCache ? '\n  /* NO_CACHE */' : '';
+
   // Consulta SQL optimizada
-  return `
+  return `${cacheHint}
   SELECT
     *,
     FORMAT_DATE('${dateFormat}', ${dateField}) as ULT_VISITA,
@@ -727,9 +731,10 @@ async function processDataInBatches(data) {
  * @param {string} agencyName - Nombre de la agencia
  * @param {Object} filters - Filtros opcionales (serie, diasSinVisita, etc.)
  * @param {boolean} useCache - Si se debe usar caché (default: true)
+ * @param {boolean} forceNoCache - Si se debe evitar la caché de BigQuery (default: false)
  * @returns {Promise<Array>} - Datos obtenidos
  */
-async function getAgencyData(agencyName, filters = {}, useCache = true) {
+async function getAgencyData(agencyName, filters = {}, useCache = true, forceNoCache = false) {
   try {
     if (!agencyConfig[agencyName]) {
       throw new Error(`Agencia no configurada: ${agencyName}`);
@@ -737,8 +742,8 @@ async function getAgencyData(agencyName, filters = {}, useCache = true) {
 
     const config = agencyConfig[agencyName];
 
-    // Generar la consulta SQL
-    const query = generateQuery(agencyName, filters);
+    // Generar la consulta SQL, pasando el parámetro forceNoCache
+    const query = generateQuery(agencyName, filters, forceNoCache);
 
     // Ejecutar la consulta
     const data = await executeQuery(config.projectId, query, useCache);
@@ -760,26 +765,50 @@ async function getAgencyData(agencyName, filters = {}, useCache = true) {
  * @param {string} agencyName - Nombre de la agencia (opcional)
  */
 function invalidateCache(agencyName = null) {
+  console.log(`Iniciando invalidación de caché${agencyName ? ' para ' + agencyName : ' completa'}`);
+
+  // 1. Limpiar caché en memoria (memoryCache)
+  if (agencyName) {
+    // Limpiar solo para una agencia específica
+    for (const key of memoryCache.keys()) {
+      if (key.startsWith(`${agencyName}:`)) {
+        console.log(`Eliminando clave de memoryCache: ${key}`);
+        memoryCache.delete(key);
+      }
+    }
+  } else {
+    // Limpiar toda la caché en memoria
+    console.log('Limpiando toda la caché en memoria');
+    memoryCache.clear();
+  }
+
+  // 2. Limpiar queryCache (caché en objeto)
   if (agencyName) {
     // Invalidar caché solo para una agencia específica
-    const keyPrefix = `${agencyConfig[agencyName]?.projectId}:`;
+    const keyPrefix = `${agencyName}:`;
     for (const key of queryCache.keys()) {
       if (key.startsWith(keyPrefix)) {
+        console.log(`Eliminando clave de queryCache: ${key}`);
         queryCache.delete(key);
       }
     }
     console.log(`Caché invalidada para la agencia: ${agencyName}`);
   } else {
     // Invalidar toda la caché
+    console.log('Limpiando totalmente queryCache');
     queryCache.clear();
     console.log('Caché completamente invalidada');
   }
 
-  // Guardar cambios en el archivo
+  // 3. Guardar cambios en el archivo de caché
   saveCacheToFile();
+  console.log('Caché guardada en archivo después de invalidación');
 
-  // También invalidar en la base de datos
+  // 4. También invalidar en la base de datos
   invalidateCacheInDb(agencyName);
+  console.log('Solicitud de invalidación de caché en DB enviada');
+
+  return true;
 }
 
 

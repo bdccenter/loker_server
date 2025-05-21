@@ -118,6 +118,42 @@ app.get('/api/data/:agencyName', async (req, res) => {
   }
 });
 
+// Endpoint para forzar actualización completa (limpia caché y recarga desde BigQuery)
+app.post('/api/force-update/:agencyName', async (req, res) => {
+  try {
+    const { agencyName } = req.params;
+    console.log(`Forzando actualización completa para: ${agencyName}`);
+    
+    // 1. Limpiar todas las capas de caché
+    invalidateCache(agencyName);
+    
+    // 2. Forzar la recarga desde BigQuery ignorando cualquier caché
+    const data = await getAgencyData(agencyName, {}, false);
+    
+    // 3. Actualizar metadata
+    const connection = await getDbConnection();
+    await connection.execute(
+      `UPDATE cache_metadata SET last_updated = NOW(), status = 'success', 
+       record_count = ?, error_message = NULL WHERE agency = ?`,
+      [data.length, agencyName]
+    );
+    connection.release();
+    
+    res.json({
+      success: true,
+      message: `Actualización forzada completada para ${agencyName}`,
+      recordCount: data.length
+    });
+  } catch (error) {
+    console.error(`Error en forzar actualización: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: "Error al realizar la actualización forzada"
+    });
+  }
+});
+
 // Nuevo endpoint para datos paginados
 app.get('/api/data/:agencyName/paginated', async (req, res) => {
   try {
