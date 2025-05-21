@@ -10,14 +10,9 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { initializeDatabase } from './service/dbInitService.js';
-import { invalidateCache } from './service/bigQueryDirectService.js';
-
-
-// Nuevas importaciones
+import { getDbConnection } from './service/dbConnection.js';
 import compression from 'compression';
 import zlib from 'zlib';
-
-// Cargar variables de entorno
 dotenv.config();
 
 // Importar servicios BigQuery
