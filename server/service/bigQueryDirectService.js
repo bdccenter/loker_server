@@ -204,6 +204,7 @@ const agencyConfig = {
 let mysqlAvailable = true;
 
 // Optimización 1: Mejor manejo de caché en memoria y base de datos
+// Optimización 1: Mejor manejo de caché en memoria y base de datos
 async function getFromCache(agencyName, queryHash) {
   // Aplicar optimización para la caché en memoria
   const memoryCacheKey = `${agencyName}:${queryHash}`;
@@ -229,7 +230,35 @@ async function getFromCache(agencyName, queryHash) {
       // Comprobar si la caché está actualizada (24 horas)
       const cacheTime = new Date(rows[0].timestamp).getTime();
       const now = Date.now();
+
+      // Asegurarse de que los tiempos son válidos
+      if (isNaN(cacheTime) || isNaN(now)) {
+        console.error('Error: Timestamp inválido detectado', {
+          cacheTimestamp: rows[0].timestamp,
+          cacheTime: cacheTime,
+          now: now
+        });
+        return null; // No usar caché con timestamps inválidos
+      }
+
       const cacheAge = now - cacheTime;
+
+      // Protección contra diferencias de tiempo negativas (posibles problemas de zona horaria)
+      if (cacheAge < 0) {
+        console.error(`Error: Diferencia de tiempo negativa detectada (${cacheAge} ms)`, {
+          cacheTime: new Date(cacheTime).toISOString(),
+          now: new Date(now).toISOString()
+        });
+
+        // Invalidar esta caché
+        try {
+          await invalidateCacheInDb(agencyName);
+        } catch (e) {
+          console.error('Error al invalidar caché con timestamp incorrecto:', e);
+        }
+
+        return null; // No usar caché con diferencias negativas
+      }
 
       // Si la caché es reciente (menos de 24 horas), usarla
       if (cacheAge < CACHE_DURATION) {
