@@ -159,6 +159,64 @@ app.post('/api/force-update/:agencyName', async (req, res) => {
   }
 });
 
+// Endpoint para forzar actualización completa de TODAS las agencias
+app.post('/api/force-update-all', async (req, res) => {
+  try {
+    console.log(`Forzando actualización completa para TODAS las agencias`);
+    
+    // Limpiar todas las capas de caché
+    await invalidateCache();
+    
+    // Array para almacenar los resultados de cada agencia
+    const results = [];
+    
+    // Para cada agencia configurada, forzar actualización
+    for (const agencyName of Object.keys(agencyConfig)) {
+      try {
+        console.log(`Actualizando datos para: ${agencyName}`);
+        
+        // Forzar la recarga desde BigQuery ignorando cualquier caché
+        const data = await getAgencyData(agencyName, {}, false, true);
+        
+        // Actualizar metadata
+        const connection = await getDbConnection();
+        await connection.execute(
+          `UPDATE cache_metadata SET last_updated = NOW(), status = 'success', 
+           record_count = ?, error_message = NULL WHERE agency = ?`,
+          [data.length, agencyName]
+        );
+        connection.release();
+        
+        results.push({
+          agency: agencyName,
+          success: true,
+          recordCount: data.length
+        });
+      } catch (agencyError) {
+        console.error(`Error al actualizar ${agencyName}:`, agencyError);
+        results.push({
+          agency: agencyName,
+          success: false,
+          error: agencyError.message
+        });
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: `Actualización forzada completada para todas las agencias`,
+      results: results
+    });
+  } catch (error) {
+    console.error(`Error en forzar actualización global:`, error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: "Error al realizar la actualización forzada global"
+    });
+  }
+});
+
 // Nuevo endpoint para datos paginados
 app.get('/api/data/:agencyName/paginated', async (req, res) => {
   try {
@@ -572,16 +630,20 @@ try {
   console.log("Intentando iniciar servicio de actualización programada...");
   const { initScheduleService } = await import('./service/scheduleDataUpdates.js');
 
-  // Iniciar el servicio (que también hará la precarga inicial)
-  await initScheduleService();
+  // Invalidar toda la caché antes de iniciar
+  console.log("Invalidando caché global antes de iniciar el servicio...");
+  await invalidateCache();
+
+  // Iniciar el servicio con opción de forzar actualización completa
+  await initScheduleService(true); // Pasamos true para indicar que queremos forzar actualización completa
   console.log("Servicio de actualización programada iniciado correctamente");
 } catch (error) {
   console.error("Error al iniciar servicio de actualización programada:", error);
 
-  // Si falla el programador, al menos intentamos cargar los datos una vez
+  // Si falla el programador, al menos intentamos cargar los datos una vez forzando actualización
   try {
-    console.log("Realizando precarga de datos fallback...");
-    await preloadAgencyData();
+    console.log("Realizando precarga de datos fallback forzada...");
+    await preloadAgencyData(null, true); // Pasamos null para todas las agencias y true para forzar
     console.log("Precarga de fallback completada");
   } catch (fallbackError) {
     console.error("Error en la precarga de fallback:", fallbackError);

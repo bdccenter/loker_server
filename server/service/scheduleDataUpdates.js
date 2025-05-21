@@ -52,9 +52,11 @@ function logMessage(message) {
 
 /**
  * Realiza la actualización de datos para todas las agencias
+ * @param {string} scheduleName - Nombre de la programación (para logs)
+ * @param {boolean} forceUpdate - Si se debe forzar actualización ignorando caché
  */
-async function performUpdate(scheduleName = 'programada') {
-  logMessage(`Iniciando actualización ${scheduleName} de datos de BigQuery`);
+async function performUpdate(scheduleName = 'programada', forceUpdate = false) {
+  logMessage(`Iniciando actualización ${scheduleName} de datos de BigQuery${forceUpdate ? ' (forzada)' : ''}`);
 
   try {
     // Obtener conexión a la base de datos
@@ -62,7 +64,7 @@ async function performUpdate(scheduleName = 'programada') {
     try {
       // Intentar conectar con 3 reintentos, 3 segundos entre intentos
       connection = await createConnectionWithRetry({}, 3, 3000);
-      
+
       // Actualizar estado de metadata a "updating"
       for (const agency of Object.keys(agencyConfig)) {
         try {
@@ -91,9 +93,9 @@ async function performUpdate(scheduleName = 'programada') {
         }
       }
     }
-    
+
     // Precargar datos de todas las agencias
-    await preloadAgencyData();
+    await preloadAgencyData(null, forceUpdate);
 
     logMessage(`✅ Actualización ${scheduleName} completada correctamente`);
     return true;
@@ -106,8 +108,9 @@ async function performUpdate(scheduleName = 'programada') {
 
 /**
  * Inicializa el servicio de actualización programada
+ * @param {boolean} forceInitialUpdate - Si se debe forzar la actualización inicial
  */
-async function initScheduleService() {
+async function initScheduleService(forceInitialUpdate = false) {
   // Configuración de zona horaria
   const cronOptions = {
     scheduled: true,
@@ -115,16 +118,16 @@ async function initScheduleService() {
   };
 
   // Programar la tarea para ejecutarse todos los días a las 9:30 AM
-  cron.schedule('30 9 * * *', () => performUpdate('diaria (9:30 AM)'), cronOptions);
+  cron.schedule('30 9 * * *', () => performUpdate('diaria (9:30 AM)', true), cronOptions);
 
   logMessage('🚀 Servicio de actualización de datos de BigQuery iniciado');
   logMessage('📅 Programado para ejecutarse todos los días a las 9:30 AM');
 
   // Ejecutar una actualización inmediata al iniciar el servicio
   logMessage('⏱️ Ejecutando una actualización inicial inmediata...');
-  
+
   try {
-    const success = await performUpdate('inicial');
+    const success = await performUpdate('inicial', forceInitialUpdate);
     if (success) {
       logMessage('✅ Actualización inicial completada con éxito.');
     } else {

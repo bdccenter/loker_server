@@ -970,9 +970,10 @@ async function invalidateCacheInDb(agencyName = null) {
 * Precarga los datos de todas las agencias o una agencia específica
 * Esta función se puede ejecutar diariamente para actualizar la caché
 * @param {string} agencyName - Nombre de la agencia (opcional)
+* @param {boolean} forceUpdate - Si se debe forzar actualización ignorando caché (default: false)
 * @returns {Promise<boolean>} - Indica si la operación fue exitosa
 */
-async function preloadAgencyData(agencyName = null) {
+async function preloadAgencyData(agencyName = null, forceUpdate = false) {
   try {
     // Agrupar agencias por projectId para minimizar el número de consultas
     const projectGroups = {};
@@ -985,7 +986,7 @@ async function preloadAgencyData(agencyName = null) {
       invalidateCache(agencyName);
 
       // Precargar con consulta básica (sin filtros)
-      await getAgencyData(agencyName, {}, true);
+      await getAgencyData(agencyName, {}, !forceUpdate, forceUpdate);
 
       console.log(`Precarga completada para: ${agencyName}`);
       // Guardar caché
@@ -1015,7 +1016,7 @@ async function preloadAgencyData(agencyName = null) {
       // Para cada agencia en este proyecto
       for (const agency of agencies) {
         console.log(`- Procesando agencia: ${agency}`);
-        await getAgencyData(agency, {}, true);
+        await getAgencyData(agency, {}, !forceUpdate, forceUpdate);
       }
 
       // Pausa breve entre cada proyecto
