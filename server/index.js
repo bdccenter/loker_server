@@ -10,6 +10,8 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { initializeDatabase } from './service/dbInitService.js';
+import { invalidateCache } from './service/bigQueryDirectService.js';
+
 
 // Nuevas importaciones
 import compression from 'compression';
@@ -37,6 +39,14 @@ if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+try {
+  console.log("Limpiando caché completa al iniciar para evitar problemas de timestamps...");
+  await invalidateCache();
+  console.log("Caché inicial limpiada correctamente");
+} catch (error) {
+  console.error("Error al limpiar caché inicial:", error);
+}
+
 // Crear la aplicación Express
 const app = express();
 const port = process.env.PORT || 3001;
@@ -55,7 +65,7 @@ app.use(express.json());
 
 try { // Incializador de base de datos
   console.log("Inicializando tablas de base de datos...");
-  await initializeDatabase(); 
+  await initializeDatabase();
   console.log("Base de datos inicializada correctamente");
 } catch (error) {
   console.error("Error al inicializar la base de datos:", error);
@@ -93,12 +103,12 @@ app.get('/api/data/:agencyName', async (req, res) => {
 
     // Configurar cabeceras de caché HTTP
     res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
-    
+
     // Generar un ETag basado en la agencia y los filtros
     const etagBase = JSON.stringify({ agencyName, filters });
     const etag = `"${crypto.createHash('md5').update(etagBase).digest('hex')}"`;
     res.setHeader('ETag', etag);
-    
+
     // Comprobar si podemos devolver 304 Not Modified
     const ifNoneMatch = req.headers['if-none-match'];
     if (ifNoneMatch && ifNoneMatch === etag) {
@@ -123,13 +133,13 @@ app.post('/api/force-update/:agencyName', async (req, res) => {
   try {
     const { agencyName } = req.params;
     console.log(`Forzando actualización completa para: ${agencyName}`);
-    
+
     // 1. Limpiar todas las capas de caché
     invalidateCache(agencyName);
-    
+
     // 2. Forzar la recarga desde BigQuery ignorando cualquier caché
     const data = await getAgencyData(agencyName, {}, false);
-    
+
     // 3. Actualizar metadata
     const connection = await getDbConnection();
     await connection.execute(
@@ -138,7 +148,7 @@ app.post('/api/force-update/:agencyName', async (req, res) => {
       [data.length, agencyName]
     );
     connection.release();
-    
+
     res.json({
       success: true,
       message: `Actualización forzada completada para ${agencyName}`,
@@ -161,40 +171,40 @@ app.get('/api/data/:agencyName/paginated', async (req, res) => {
     const start = parseInt(req.query.start || '0', 10);
     const limit = parseInt(req.query.limit || '100', 10);
     const useCache = req.query.useCache !== 'false';
-    
+
     console.log(`Solicitud de datos paginados para agencia: ${agencyName}, inicio: ${start}, límite: ${limit}`);
-    
+
     // Configurar cabeceras de caché HTTP
     res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
-    
+
     // Extraer filtros de los query params
     const filters = { ...req.query };
     delete filters.start;
     delete filters.limit;
     delete filters.useCache;
-    
+
     // Intentar obtener datos completos desde la caché
     let allData;
-    
+
     try {
       // Generar un hash para la consulta sin paginación
       const baseQueryHash = crypto.createHash('md5').update(JSON.stringify(filters)).digest('hex');
       const allDataCacheKey = `${agencyName}:${baseQueryHash}`;
-      
+
       // Buscar en caché primero
       allData = await getFromCache(agencyName, baseQueryHash);
-      
+
       if (!allData) {
         // Si no está en caché, obtener datos completos
         allData = await getAgencyData(agencyName, filters, useCache);
       }
     } catch (cacheError) {
       console.error('Error al obtener datos completos:', cacheError);
-      
+
       // Si falla la caché, cargar los datos normalmente
       allData = await getAgencyData(agencyName, filters, useCache);
     }
-    
+
     // Si no hay datos, devolver array vacío
     if (!allData || allData.length === 0) {
       return res.json({
@@ -205,15 +215,15 @@ app.get('/api/data/:agencyName/paginated', async (req, res) => {
         totalPages: 0
       });
     }
-    
+
     // Calcular información de paginación
     const totalItems = allData.length;
     const totalPages = Math.ceil(totalItems / limit);
     const currentPage = Math.floor(start / limit) + 1;
-    
+
     // Obtener solo la porción solicitada
     const paginatedData = allData.slice(start, start + limit);
-    
+
     // Enviar respuesta con metadatos de paginación
     res.json({
       data: paginatedData,

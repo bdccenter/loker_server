@@ -243,20 +243,24 @@ async function getFromCache(agencyName, queryHash) {
       const cacheAge = now - cacheTime;
 
       // Protección contra diferencias de tiempo negativas (posibles problemas de zona horaria)
-      if (cacheAge < 0) {
-        console.error(`Error: Diferencia de tiempo negativa detectada (${cacheAge} ms)`, {
+      // Protección contra diferencias de tiempo negativas o fechas muy futuras
+      if (cacheAge < 0 || new Date(cacheTime).getFullYear() > 2100) {
+        console.error(`Error: Problema con timestamp detectado`, {
           cacheTime: new Date(cacheTime).toISOString(),
-          now: new Date(now).toISOString()
+          now: new Date(now).toISOString(),
+          diferencia: cacheAge,
+          año: new Date(cacheTime).getFullYear()
         });
 
-        // Invalidar esta caché
+        // Invalidar esta caché problemática
         try {
           await invalidateCacheInDb(agencyName);
+          console.log(`Caché con timestamp problemático invalidada automáticamente para ${agencyName}`);
         } catch (e) {
           console.error('Error al invalidar caché con timestamp incorrecto:', e);
         }
 
-        return null; // No usar caché con diferencias negativas
+        return null; // No usar caché con diferencias negativas o fechas futuras
       }
 
       // Si la caché es reciente (menos de 24 horas), usarla
@@ -309,7 +313,15 @@ async function saveToCache(agencyName, queryHash, data) {
 
     // Verificar que estamos guardando un timestamp válido y razonable
     const now = new Date();
-    
+    const maxAllowedYear = now.getFullYear() + 1; // Permitir máximo un año en el futuro
+    if (!isValidDate(now)) {
+      console.error(`Timestamp del sistema inválido detectado: ${now.toISOString()}`);
+      // Intentar obtener una fecha válida
+      const systemDate = new Date();
+      console.log(`Usando fecha alternativa: ${systemDate.toISOString()}`);
+      // Continuar usando systemDate en lugar de now en el resto de la función
+    }
+
     // Verificación del timestamp actual
     if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
       console.error(`Timestamp inválido detectado (${now.toISOString()}), ajustando a fecha del sistema`);
@@ -489,6 +501,22 @@ async function loadFromCSV(filePath, filters = {}) {
       reject(error);
     }
   });
+}
+
+/**
+ * Verifica si una fecha es válida y está dentro de un rango razonable
+ * @param {Date|string|number} date - Fecha a verificar
+ * @returns {boolean} - true si la fecha es válida
+ */
+function isValidDate(date) {
+  if (!date) return false;
+
+  const dateObj = date instanceof Date ? date : new Date(date);
+  const currentYear = new Date().getFullYear();
+
+  return !isNaN(dateObj.getTime()) &&
+    dateObj.getFullYear() >= 2020 &&
+    dateObj.getFullYear() <= currentYear + 1;
 }
 
 /**
