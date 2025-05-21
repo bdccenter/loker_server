@@ -190,13 +190,6 @@ const agencyConfig = {
     tableName: 'tab_bafac_ur',
     dateField: 'FECHA_FACT',
     dateFormat: '%d/%m/%Y'
-  },
-  'Gasme': {
-    projectId: 'base-maestra-gn',
-    datasetName: 'Posventa',
-    tableName: 'tab_bafac_ur',
-    dateField: 'FECHA_FAC',
-    dateFormat: '%d/%m/%Y'
   }
 };
 
