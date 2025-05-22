@@ -9,6 +9,7 @@ import zlib from 'zlib';
 import { getDbConnection } from './dbConnection.js';
 import Papa from 'papaparse';
 
+
 // Obtener la ruta del archivo actual
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -302,7 +303,7 @@ async function saveToCache(agencyName, queryHash, data) {
 
     // Verificar que estamos guardando un timestamp válido y razonable
     const now = new Date();
-    
+
     // Verificación del timestamp actual
     if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
       console.error(`Timestamp inválido detectado (${now.toISOString()}), ajustando a fecha del sistema`);
@@ -805,7 +806,7 @@ async function processDataInBatches(data) {
  * @param {string} agencyName - Nombre de la agencia
  * @param {Object} filters - Filtros opcionales (serie, diasSinVisita, etc.)
  * @param {boolean} useCache - Si se debe usar caché (default: true)
- * @param {boolean} forceNoCache - Si se debe evitar la caché de BigQuery (default: false)
+ * @param {boolean} forceNoCache - Si se debe evitar TODA la caché y forzar desde BigQuery (default: false)
  * @returns {Promise<Array>} - Datos obtenidos
  */
 async function getAgencyData(agencyName, filters = {}, useCache = true, forceNoCache = false) {
@@ -816,73 +817,172 @@ async function getAgencyData(agencyName, filters = {}, useCache = true, forceNoC
 
     const config = agencyConfig[agencyName];
 
-    // Generar la consulta SQL, pasando el parámetro forceNoCache
-    const query = generateQuery(agencyName, filters, forceNoCache);
+    // Si forceNoCache es true, ignorar toda la caché y ir directo a BigQuery
+    if (forceNoCache) {
+      console.log(`🔄 FORZANDO CARGA DESDE BIGQUERY para ${agencyName} (ignorando toda caché)`);
 
-    // Ejecutar la consulta
+      // Invalidar caché existente para esta agencia
+      await invalidateCache(agencyName);
+
+      // Generar consulta con hint para evitar caché de BigQuery también
+      const query = generateQuery(agencyName, filters, true); // forceNoCache=true para BigQuery
+
+      // Ejecutar consulta directamente sin verificar caché
+      const data = await executeQuery(config.projectId, query, false); // useCache=false
+
+      console.log(`✅ DATOS FRESCOS desde BigQuery para ${agencyName}: ${data.length} registros`);
+      return data;
+    }
+
+    // Generar la consulta SQL
+    const query = generateQuery(agencyName, filters, false);
+
+    // Ejecutar la consulta (con caché normal si useCache=true)
     const data = await executeQuery(config.projectId, query, useCache);
 
     if (!data || data.length === 0) {
-      console.warn(`No se encontraron datos para ${agencyName}`);
+      console.warn(`⚠️ No se encontraron datos para ${agencyName}`);
       return [];
     }
 
     return data;
   } catch (error) {
-    console.error(`Error al obtener datos para ${agencyName}:`, error);
+    console.error(`❌ Error al obtener datos para ${agencyName}:`, error);
     throw error;
   }
 }
 
 /**
- * Invalida la caché para todas las consultas o para una agencia específica
+ * Invalida COMPLETAMENTE la caché para todas las consultas o para una agencia específica
  * @param {string} agencyName - Nombre de la agencia (opcional)
  */
-function invalidateCache(agencyName = null) {
-  console.log(`Iniciando invalidación de caché${agencyName ? ' para ' + agencyName : ' completa'}`);
+async function invalidateCache(agencyName = null) {
+  console.log(`🧹 INVALIDACIÓN COMPLETA DE CACHÉ ${agencyName ? 'para ' + agencyName : 'GLOBAL'}`);
 
-  // 1. Limpiar caché en memoria (memoryCache)
-  if (agencyName) {
-    // Limpiar solo para una agencia específica
-    for (const key of memoryCache.keys()) {
-      if (key.startsWith(`${agencyName}:`)) {
-        console.log(`Eliminando clave de memoryCache: ${key}`);
-        memoryCache.delete(key);
+  try {
+    // 1. LIMPIAR CACHÉ EN MEMORIA (memoryCache)
+    if (agencyName) {
+      let removedCount = 0;
+      for (const key of memoryCache.keys()) {
+        if (key.startsWith(`${agencyName}:`)) {
+          memoryCache.delete(key);
+          removedCount++;
+        }
       }
+      console.log(`✅ Eliminadas ${removedCount} entradas de memoryCache para ${agencyName}`);
+    } else {
+      const totalKeys = memoryCache.size;
+      memoryCache.clear();
+      console.log(`✅ Limpiada memoryCache completa: ${totalKeys} entradas eliminadas`);
     }
-  } else {
-    // Limpiar toda la caché en memoria
-    console.log('Limpiando toda la caché en memoria');
-    memoryCache.clear();
-  }
 
-  // 2. Limpiar queryCache (caché en objeto)
-  if (agencyName) {
-    // Invalidar caché solo para una agencia específica
-    const keyPrefix = `${agencyName}:`;
-    for (const key of queryCache.keys()) {
-      if (key.startsWith(keyPrefix)) {
-        console.log(`Eliminando clave de queryCache: ${key}`);
+    // 2. LIMPIAR CACHÉ DE ARCHIVO (queryCache)
+    if (agencyName) {
+      let removedCount = 0;
+      const keysToRemove = [];
+      for (const key of queryCache.keys()) {
+        if (key.startsWith(`${agencyName}:`)) {
+          keysToRemove.push(key);
+        }
+      }
+      keysToRemove.forEach(key => {
         queryCache.delete(key);
-      }
+        removedCount++;
+      });
+      console.log(`✅ Eliminadas ${removedCount} entradas de queryCache para ${agencyName}`);
+    } else {
+      const totalKeys = queryCache.size;
+      queryCache.clear();
+      console.log(`✅ Limpiada queryCache completa: ${totalKeys} entradas eliminadas`);
     }
-    console.log(`Caché invalidada para la agencia: ${agencyName}`);
-  } else {
-    // Invalidar toda la caché
-    console.log('Limpiando totalmente queryCache');
-    queryCache.clear();
-    console.log('Caché completamente invalidada');
+
+    // 3. GUARDAR CAMBIOS EN ARCHIVO
+    saveCacheToFile();
+    console.log(`✅ Archivo de caché actualizado`);
+
+    // 4. LIMPIAR CACHÉ EN BASE DE DATOS
+    await invalidateCacheInDb(agencyName);
+    console.log(`✅ Caché en base de datos invalidada`);
+
+    // 5. ELIMINAR ARCHIVOS CSV DE CACHÉ (si existen) - USANDO IMPORTS ES6
+    const csvDir = path.join(__dirname, '../../../cache/csv');
+
+    if (fs.existsSync(csvDir)) {
+      const files = fs.readdirSync(csvDir);
+      let removedFiles = 0;
+
+      files.forEach(file => {
+        if (agencyName) {
+          // Solo eliminar archivos relacionados con la agencia específica
+          if (file.toLowerCase().includes(agencyName.toLowerCase().replace(' ', ''))) {
+            fs.unlinkSync(path.join(csvDir, file));
+            removedFiles++;
+          }
+        } else {
+          // Eliminar todos los archivos CSV
+          fs.unlinkSync(path.join(csvDir, file));
+          removedFiles++;
+        }
+      });
+
+      console.log(`✅ Eliminados ${removedFiles} archivos CSV de caché`);
+    }
+
+    console.log(`🎉 INVALIDACIÓN COMPLETA TERMINADA ${agencyName ? 'para ' + agencyName : 'GLOBAL'}`);
+    return true;
+
+  } catch (error) {
+    console.error('❌ Error durante invalidación de caché:', error);
+    return false;
   }
+}
 
-  // 3. Guardar cambios en el archivo de caché
-  saveCacheToFile();
-  console.log('Caché guardada en archivo después de invalidación');
+/**
+ * Invalida FORZOSAMENTE toda la caché del sistema
+ */
+async function forceCompleteInvalidation() {
+  console.log('🚨 INVALIDACIÓN FORZOSA COMPLETA DEL SISTEMA');
 
-  // 4. También invalidar en la base de datos
-  invalidateCacheInDb(agencyName);
-  console.log('Solicitud de invalidación de caché en DB enviada');
+  try {
+    // 1. Limpiar todo en memoria
+    memoryCache.clear();
+    queryCache.clear();
 
-  return true;
+    // 2. Eliminar archivo de caché principal - USANDO IMPORTS ES6
+    const cacheFile = path.join(__dirname, '../../../cache/bigquery_cache.json');
+
+    if (fs.existsSync(cacheFile)) {
+      fs.unlinkSync(cacheFile);
+      console.log('✅ Archivo principal de caché eliminado');
+    }
+
+    // 3. Eliminar toda la carpeta de caché CSV - USANDO IMPORTS ES6
+    const csvDir = path.join(__dirname, '../../../cache/csv');
+    if (fs.existsSync(csvDir)) {
+      const files = fs.readdirSync(csvDir);
+      files.forEach(file => {
+        fs.unlinkSync(path.join(csvDir, file));
+      });
+      console.log(`✅ Eliminados ${files.length} archivos CSV`);
+    }
+
+    // 4. Truncar tablas de caché en base de datos
+    const connection = await getDbConnection();
+    await connection.execute('TRUNCATE TABLE query_cache');
+    await connection.execute('UPDATE cache_metadata SET status = "invalidated", last_updated = NOW()');
+    connection.release();
+    console.log('✅ Tablas de base de datos limpiadas');
+
+    // 5. Recrear archivo de caché vacío
+    saveCacheToFile();
+
+    console.log('🎉 INVALIDACIÓN FORZOSA COMPLETA TERMINADA');
+    return true;
+
+  } catch (error) {
+    console.error('❌ Error durante invalidación forzosa:', error);
+    return false;
+  }
 }
 
 
@@ -998,7 +1098,6 @@ async function preloadAgencyData(agencyName = null) {
   }
 }
 
-
 // Exportar funciones
 export {
   getAgencyData,
@@ -1011,5 +1110,6 @@ export {
   getFromCache,
   saveToCache,
   getDbConnection,
-  invalidateCacheInDb  // Añadir esta nueva exportación
+  invalidateCacheInDb,
+  memoryCache
 };

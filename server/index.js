@@ -1,5 +1,3 @@
-// server/index.js
-
 // Importaciones existentes
 import express from 'express';
 import cors from 'cors';
@@ -10,16 +8,16 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { initializeDatabase } from './service/dbInitService.js';
-
-// Nuevas importaciones
+import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache, getFromCache } from './service/bigQueryDirectService.js';
 import compression from 'compression';
 import zlib from 'zlib';
+
 
 // Cargar variables de entorno
 dotenv.config();
 
 // Importar servicios BigQuery
-import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache, getFromCache } from './service/bigQueryDirectService.js';
+
 
 // Obtener la ruta del archivo actual (necesario en ES modules)
 const __filename = fileURLToPath(import.meta.url);
@@ -55,7 +53,7 @@ app.use(express.json());
 
 try { // Incializador de base de datos
   console.log("Inicializando tablas de base de datos...");
-  await initializeDatabase(); 
+  await initializeDatabase();
   console.log("Base de datos inicializada correctamente");
 } catch (error) {
   console.error("Error al inicializar la base de datos:", error);
@@ -93,12 +91,12 @@ app.get('/api/data/:agencyName', async (req, res) => {
 
     // Configurar cabeceras de caché HTTP
     res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
-    
+
     // Generar un ETag basado en la agencia y los filtros
     const etagBase = JSON.stringify({ agencyName, filters });
     const etag = `"${crypto.createHash('md5').update(etagBase).digest('hex')}"`;
     res.setHeader('ETag', etag);
-    
+
     // Comprobar si podemos devolver 304 Not Modified
     const ifNoneMatch = req.headers['if-none-match'];
     if (ifNoneMatch && ifNoneMatch === etag) {
@@ -123,22 +121,23 @@ app.post('/api/force-update/:agencyName', async (req, res) => {
   try {
     const { agencyName } = req.params;
     console.log(`Forzando actualización completa para: ${agencyName}`);
-    
+
     // 1. Limpiar todas las capas de caché
     invalidateCache(agencyName);
-    
+
     // 2. Forzar la recarga desde BigQuery ignorando cualquier caché
     const data = await getAgencyData(agencyName, {}, false);
-    
+
     // 3. Actualizar metadata
-    const connection = await getDbConnection();
+    const connection = await pool.getConnection();
     await connection.execute(
       `UPDATE cache_metadata SET last_updated = NOW(), status = 'success', 
        record_count = ?, error_message = NULL WHERE agency = ?`,
       [data.length, agencyName]
     );
-    connection.release();
-    
+    if (connection) connection.release();
+
+
     res.json({
       success: true,
       message: `Actualización forzada completada para ${agencyName}`,
@@ -161,40 +160,40 @@ app.get('/api/data/:agencyName/paginated', async (req, res) => {
     const start = parseInt(req.query.start || '0', 10);
     const limit = parseInt(req.query.limit || '100', 10);
     const useCache = req.query.useCache !== 'false';
-    
+
     console.log(`Solicitud de datos paginados para agencia: ${agencyName}, inicio: ${start}, límite: ${limit}`);
-    
+
     // Configurar cabeceras de caché HTTP
     res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutos
-    
+
     // Extraer filtros de los query params
     const filters = { ...req.query };
     delete filters.start;
     delete filters.limit;
     delete filters.useCache;
-    
+
     // Intentar obtener datos completos desde la caché
     let allData;
-    
+
     try {
       // Generar un hash para la consulta sin paginación
       const baseQueryHash = crypto.createHash('md5').update(JSON.stringify(filters)).digest('hex');
       const allDataCacheKey = `${agencyName}:${baseQueryHash}`;
-      
+
       // Buscar en caché primero
       allData = await getFromCache(agencyName, baseQueryHash);
-      
+
       if (!allData) {
         // Si no está en caché, obtener datos completos
         allData = await getAgencyData(agencyName, filters, useCache);
       }
     } catch (cacheError) {
       console.error('Error al obtener datos completos:', cacheError);
-      
+
       // Si falla la caché, cargar los datos normalmente
       allData = await getAgencyData(agencyName, filters, useCache);
     }
-    
+
     // Si no hay datos, devolver array vacío
     if (!allData || allData.length === 0) {
       return res.json({
@@ -205,15 +204,15 @@ app.get('/api/data/:agencyName/paginated', async (req, res) => {
         totalPages: 0
       });
     }
-    
+
     // Calcular información de paginación
     const totalItems = allData.length;
     const totalPages = Math.ceil(totalItems / limit);
     const currentPage = Math.floor(start / limit) + 1;
-    
+
     // Obtener solo la porción solicitada
     const paginatedData = allData.slice(start, start + limit);
-    
+
     // Enviar respuesta con metadatos de paginación
     res.json({
       data: paginatedData,
@@ -533,6 +532,136 @@ app.post('/login', async (req, res) => {
     res.status(500).json({ message: 'Error en el servidor' });
   } finally {
     if (connection) connection.release();
+  }
+});
+
+// Endpoint para diagnóstico de caché (VERSIÓN SIMPLIFICADA)
+// Endpoint para diagnóstico de caché (VERSIÓN CORREGIDA)
+app.get('/api/cache/debug/:agencyName', async (req, res) => {
+  try {
+    const { agencyName } = req.params;
+
+    // Verificar caché en base de datos
+    const connection = await pool.getConnection();
+    const [dbCache] = await connection.execute(
+      'SELECT cache_key, timestamp, is_compressed, LENGTH(data) as data_size FROM query_cache WHERE cache_key LIKE ?',
+      [`${agencyName}:%`]
+    );
+    const [metadata] = await connection.execute(
+      'SELECT * FROM cache_metadata WHERE agency = ?',
+      [agencyName]
+    );
+    connection.release();
+
+    // Verificar archivos de caché
+    const cacheDir = path.join(__dirname, '../cache');
+    const cacheFile = path.join(cacheDir, 'bigquery_cache.json');
+
+    let fileCacheInfo = null;
+    if (fs.existsSync(cacheFile)) {
+      const stats = fs.statSync(cacheFile);
+      fileCacheInfo = {
+        exists: true,
+        size: stats.size,
+        modified: stats.mtime,
+        age: Date.now() - stats.mtime.getTime()
+      };
+    } else {
+      fileCacheInfo = { exists: false };
+    }
+
+    res.json({
+      agency: agencyName,
+      timestamp: new Date().toISOString(),
+      databaseCache: {
+        count: dbCache.length,
+        entries: dbCache.slice(0, 5), // Solo mostrar primeros 5 para no sobrecargar
+        metadata: metadata[0] || null
+      },
+      fileCache: fileCacheInfo,
+      cacheConstants: {
+        CACHE_DURATION: 24 * 60 * 60 * 1000, // 24 horas
+        MEMORY_CACHE_TTL: 30 * 60 * 1000     // 30 minutos
+      }
+    });
+  } catch (error) {
+    console.error('Error en diagnóstico de caché:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint para forzar invalidación completa y actualización desde BigQuery
+app.post('/api/force-complete-refresh/:agencyName?', async (req, res) => {
+  try {
+    const { agencyName } = req.params;
+    const forceAll = req.body.forceAll === true;
+
+    console.log(`🚀 Iniciando actualización forzosa ${agencyName ? `para ${agencyName}` : 'completa'}`);
+
+    // Importar la función de invalidación mejorada
+    const { forceCompleteInvalidation, invalidateCache } = await import('./service/bigQueryDirectService.js');
+
+    // 1. Invalidar caché completamente
+    if (forceAll) {
+      await forceCompleteInvalidation();
+    } else {
+      await invalidateCache(agencyName);
+    }
+
+    // 2. Forzar recarga desde BigQuery
+    const { getAgencyData } = await import('./service/bigQueryDirectService.js');
+
+    if (agencyName) {
+      // Actualizar solo una agencia
+      console.log(`📊 Cargando datos frescos para ${agencyName}...`);
+      const data = await getAgencyData(agencyName, {}, false, true); // useCache=false, forceNoCache=true
+
+      console.log(`✅ ${agencyName}: ${data.length} registros cargados desde BigQuery`);
+
+      res.json({
+        success: true,
+        message: `Actualización completa para ${agencyName} completada`,
+        recordCount: data.length,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      // Actualizar todas las agencias
+      const { agencyConfig } = await import('./service/bigQueryDirectService.js');
+      const results = {};
+
+      for (const agency of Object.keys(agencyConfig)) {
+        try {
+          console.log(`📊 Cargando datos frescos para ${agency}...`);
+          const data = await getAgencyData(agency, {}, false, true);
+          results[agency] = {
+            success: true,
+            recordCount: data.length
+          };
+          console.log(`✅ ${agency}: ${data.length} registros cargados desde BigQuery`);
+        } catch (error) {
+          console.error(`❌ Error en ${agency}:`, error);
+          results[agency] = {
+            success: false,
+            error: error.message
+          };
+        }
+      }
+
+      res.json({
+        success: true,
+        message: 'Actualización completa para todas las agencias completada',
+        results,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Error en actualización forzosa:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: "Error al realizar la actualización forzosa"
+    });
   }
 });
 
