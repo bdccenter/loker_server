@@ -166,7 +166,7 @@ try {
 const agencyConfig = {
   'Gran Auto': {
     projectId: 'base-maestra-gn',
-    datasetName: 'Posventa',
+    datasetName: 'BASE_MAESTRA',  // <<<< CAMBIAR AQUÍ
     tableName: 'tab_bafac_ur',
     dateField: 'FECHA_FAC',
     dateFormat: '%d/%m/%Y'
