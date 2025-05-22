@@ -11,6 +11,8 @@ import { initializeDatabase } from './service/dbInitService.js';
 import { getAgencyData, invalidateCache, preloadAgencyData, agencyConfig, queryCache, getFromCache } from './service/bigQueryDirectService.js';
 import compression from 'compression';
 import zlib from 'zlib';
+import { getDbConnection } from './service/dbConnection.js';
+
 
 
 // Cargar variables de entorno
@@ -115,6 +117,92 @@ app.get('/api/data/:agencyName', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Script para limpiar la caché corrompida con timestamps incorrectos
+// Ejecutar este endpoint o agregar esta función al servidor
+
+// OPCIÓN 1: Endpoint para limpiar caché corrompida
+app.post('/api/fix-corrupted-cache', async (req, res) => {
+  try {
+    console.log('🔧 Iniciando limpieza de caché corrompida...');
+    
+    const connection = await getDbConnection();
+    
+    // 1. Buscar entradas con timestamps futuros incorrectos (después de 2030)
+    const [corruptedEntries] = await connection.execute(`
+      SELECT cache_key, timestamp 
+      FROM query_cache 
+      WHERE YEAR(timestamp) > 2030 OR YEAR(timestamp) < 2020
+    `);
+    
+    console.log(`🔍 Encontradas ${corruptedEntries.length} entradas con timestamps corruptos`);
+    
+    if (corruptedEntries.length > 0) {
+      // Mostrar los timestamps corruptos
+      corruptedEntries.forEach(entry => {
+        console.log(`❌ Timestamp corrompido: ${entry.cache_key} -> ${entry.timestamp}`);
+      });
+      
+      // 2. Eliminar todas las entradas con timestamps incorrectos
+      await connection.execute(`
+        DELETE FROM query_cache 
+        WHERE YEAR(timestamp) > 2030 OR YEAR(timestamp) < 2020
+      `);
+      
+      console.log(`🗑️ Eliminadas ${corruptedEntries.length} entradas corruptas`);
+    }
+    
+    // 3. Verificar y limpiar metadata con fechas incorrectas
+    const [corruptedMeta] = await connection.execute(`
+      SELECT agency, last_updated 
+      FROM cache_metadata 
+      WHERE YEAR(last_updated) > 2030 OR YEAR(last_updated) < 2020
+    `);
+    
+    if (corruptedMeta.length > 0) {
+      console.log(`🔍 Encontradas ${corruptedMeta.length} entradas de metadata corruptas`);
+      
+      // Actualizar metadata con fecha actual
+      await connection.execute(`
+        UPDATE cache_metadata 
+        SET last_updated = NOW(), status = 'invalidated' 
+        WHERE YEAR(last_updated) > 2030 OR YEAR(last_updated) < 2020
+      `);
+      
+      console.log(`🔄 Metadata corregida para ${corruptedMeta.length} agencias`);
+    }
+    
+    connection.release();
+    
+    // 4. Limpiar caché en memoria
+    const { invalidateCache } = await import('./service/bigQueryDirectService.js');
+    await invalidateCache(); // Limpiar toda la caché
+    
+    // 5. Forzar recarga de datos frescos
+    const { preloadAgencyData } = await import('./service/bigQueryDirectService.js');
+    await preloadAgencyData();
+    
+    console.log('✅ Limpieza de caché corrompida completada');
+    
+    res.json({
+      success: true,
+      message: 'Caché corrompida limpiada y datos recargados',
+      corruptedCacheEntries: corruptedEntries.length,
+      corruptedMetaEntries: corruptedMeta.length,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('❌ Error al limpiar caché corrompida:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// OPCIÓN 2: Función mejorada de validación de timestamps
+
 
 // Endpoint para forzar actualización completa (limpia caché y recarga desde BigQuery)
 app.post('/api/force-update/:agencyName', async (req, res) => {

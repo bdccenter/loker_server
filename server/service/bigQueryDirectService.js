@@ -166,7 +166,7 @@ try {
 const agencyConfig = {
   'Gran Auto': {
     projectId: 'base-maestra-gn',
-    datasetName: 'BASE_MAESTRA',  // <<<< CAMBIAR AQUÍ
+    datasetName: 'BASE_MAESTRA',
     tableName: 'tab_bafac_ur',
     dateField: 'FECHA_FAC',
     dateFormat: '%d/%m/%Y'
@@ -286,151 +286,78 @@ async function getFromCache(agencyName, queryHash) {
   }
 }
 
-
 // Función para guardar en caché con mejor manejo de errores
 async function saveToCache(agencyName, queryHash, data) {
-  // También guardar en caché de memoria
+  // Guardar en caché de memoria
   setMemoryCache(`${agencyName}:${queryHash}`, data);
 
-  // Si MySQL no está disponible, no intentar guardar
   if (!mysqlAvailable) {
-    console.log(`MySQL no disponible, no se guardará en caché DB para ${agencyName}`);
     return false;
   }
 
   try {
     const connection = await getDbConnection();
 
-    // Verificar que estamos guardando un timestamp válido y razonable
-    const now = new Date();
+    // ⚠️ IMPORTANTE: USAR SIEMPRE NOW() DE MYSQL
+    // No usar new Date() de JavaScript que puede estar corrompido
 
-    // Verificación del timestamp actual
-    if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
-      console.error(`Timestamp inválido detectado (${now.toISOString()}), ajustando a fecha del sistema`);
-      // Forzar fecha actual del sistema
-      const systemDate = new Date();
-      // Ejecutar primero la verificación de timestamp para evitar guardar fechas incorrectas
-      await connection.execute(
-        `INSERT INTO cache_metadata (agency, last_updated, record_count, status) 
-         VALUES (?, ?, ?, 'success') 
-         ON DUPLICATE KEY UPDATE last_updated = ?, record_count = VALUES(record_count), 
-         status = 'success', error_message = NULL`,
-        [agencyName, systemDate, data.length, systemDate]
-      );
-    } else {
-      // Guardar metadata primero con NOW() de MySQL (menos propenso a errores)
-      await connection.execute(
-        `INSERT INTO cache_metadata (agency, last_updated, record_count, status) 
-         VALUES (?, NOW(), ?, 'success') 
-         ON DUPLICATE KEY UPDATE last_updated = NOW(), record_count = VALUES(record_count), 
-         status = 'success', error_message = NULL`,
-        [agencyName, data.length]
-      );
-    }
+    await connection.execute(
+      `INSERT INTO cache_metadata (agency, last_updated, record_count, status) 
+       VALUES (?, NOW(), ?, 'success') 
+       ON DUPLICATE KEY UPDATE 
+       last_updated = NOW(), 
+       record_count = VALUES(record_count), 
+       status = 'success', 
+       error_message = NULL`,
+      [agencyName, data.length]
+    );
 
-    // Convertir datos a JSON
     const jsonData = JSON.stringify(data);
     const dataSize = Buffer.byteLength(jsonData, 'utf8');
 
-    // Si los datos son mayores a 1MB, comprimir
     if (dataSize > 1 * 1024 * 1024) {
-      try {
-        console.log(`Comprimiendo datos (${Math.round(dataSize / 1024 / 1024)}MB) para ${agencyName}`);
-        const compressedData = zlib.gzipSync(jsonData).toString('base64');
-        const compressedSize = Buffer.byteLength(compressedData, 'utf8');
-        console.log(`Datos comprimidos a ${Math.round(compressedSize / 1024 / 1024)}MB (ahorro: ${Math.round((1 - compressedSize / dataSize) * 100)}%)`);
-
-        // Si los datos comprimidos son muy grandes (más de 16MB), guardar solo en caché de memoria
-        if (compressedSize > 16 * 1024 * 1024) {
-          console.log(`Datos comprimidos demasiado grandes para MySQL (${Math.round(compressedSize / 1024 / 1024)}MB), guardando solo en caché de memoria`);
-          connection.release();
-          return false;
-        }
-
-        // Usar la misma lógica de verificación de timestamp para los datos
-        if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
-          const systemDate = new Date();
-          // Intentar insertar los datos comprimidos con timestamp explícito
-          await connection.execute(
-            `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-             VALUES (?, ?, ?, 1) 
-             ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = ?, is_compressed = 1`,
-            [`${agencyName}:${queryHash}`, compressedData, systemDate, systemDate]
-          );
-        } else {
-          // Usar NOW() de MySQL (opción más segura)
-          await connection.execute(
-            `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-             VALUES (?, ?, NOW(), 1) 
-             ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 1`,
-            [`${agencyName}:${queryHash}`, compressedData]
-          );
-        }
-
-        connection.release();
+      const compressedData = zlib.gzipSync(jsonData).toString('base64');
+      const compressedSize = Buffer.byteLength(compressedData, 'utf8');
+      
+      if (compressedSize <= 16 * 1024 * 1024) {
+        // USAR NOW() DE MYSQL - MÁS CONFIABLE
+        await connection.execute(
+          `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
+           VALUES (?, ?, NOW(), 1) 
+           ON DUPLICATE KEY UPDATE 
+           data = VALUES(data), 
+           timestamp = NOW(), 
+           is_compressed = 1`,
+          [`${agencyName}:${queryHash}`, compressedData]
+        );
+        
         console.log(`Caché comprimida actualizada para ${agencyName}: ${data.length} registros`);
-        return true;
-      } catch (compressError) {
-        console.error('Error al comprimir datos:', compressError);
-        // Si hay error en compresión, intentar guardar sin comprimir si no son demasiado grandes
-        if (dataSize <= 5 * 1024 * 1024) {
-          // Verificar timestamp también aquí
-          if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
-            const systemDate = new Date();
-            await connection.execute(
-              `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-               VALUES (?, ?, ?, 0) 
-               ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = ?, is_compressed = 0`,
-              [`${agencyName}:${queryHash}`, jsonData, systemDate, systemDate]
-            );
-          } else {
-            await connection.execute(
-              `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-               VALUES (?, ?, NOW(), 0) 
-               ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 0`,
-              [`${agencyName}:${queryHash}`, jsonData]
-            );
-          }
-
-          connection.release();
-          console.log(`Caché sin comprimir actualizada para ${agencyName}: ${data.length} registros`);
-          return true;
-        } else {
-          console.log(`Datos demasiado grandes para MySQL sin comprimir (${Math.round(dataSize / 1024 / 1024)}MB)`);
-          connection.release();
-          return false;
-        }
+      } else {
+        console.log(`Datos comprimidos demasiado grandes para MySQL (${Math.round(compressedSize / 1024 / 1024)}MB), guardando solo en caché de memoria`);
       }
     } else {
-      // Si los datos son pequeños, guardarlos sin comprimir
-      // Verificar timestamp también aquí
-      if (now.getFullYear() > 2100 || now.getFullYear() < 2020) {
-        const systemDate = new Date();
-        await connection.execute(
-          `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-           VALUES (?, ?, ?, 0) 
-           ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = ?, is_compressed = 0`,
-          [`${agencyName}:${queryHash}`, jsonData, systemDate, systemDate]
-        );
-      } else {
-        await connection.execute(
-          `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
-           VALUES (?, ?, NOW(), 0) 
-           ON DUPLICATE KEY UPDATE data = VALUES(data), timestamp = NOW(), is_compressed = 0`,
-          [`${agencyName}:${queryHash}`, jsonData]
-        );
-      }
-
-      connection.release();
-      console.log(`Caché actualizada para ${agencyName}: ${data.length} registros`);
-      return true;
+      await connection.execute(
+        `INSERT INTO query_cache (cache_key, data, timestamp, is_compressed) 
+         VALUES (?, ?, NOW(), 0) 
+         ON DUPLICATE KEY UPDATE 
+         data = VALUES(data), 
+         timestamp = NOW(), 
+         is_compressed = 0`,
+        [`${agencyName}:${queryHash}`, jsonData]
+      );
+      
+      console.log(`✅ Caché actualizada para ${agencyName}: ${data.length} registros`);
     }
+
+    connection.release();
+    return true;
+
   } catch (error) {
     console.error('Error al guardar en caché MySQL:', error);
-
+    
     // Marcar MySQL como no disponible después de ciertos errores
     if (error.code === 'PROTOCOL_CONNECTION_LOST' || error.code === 'ETIMEDOUT' ||
-      error.code === 'ER_NET_PACKET_TOO_LARGE') {
+        error.code === 'ER_NET_PACKET_TOO_LARGE') {
       console.warn('Error de conexión o datos muy grandes. Se usará solo caché en memoria.');
       mysqlAvailable = false;
 
@@ -444,6 +371,7 @@ async function saveToCache(agencyName, queryHash, data) {
     return false;
   }
 }
+
 
 // Optimización 3: Soporte para CSV como caché adicional
 /**
